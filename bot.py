@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import logging
+import time
 import aiosqlite
 import qrcode
 from dotenv import load_dotenv
@@ -23,6 +24,8 @@ LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
 UPI_ID_TEXT = os.getenv("UPI_ID_TEXT", "yourupi@bank")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "Account Store")
+
+MIN_DEPOSIT = 50.0
 
 DB_NAME = "shop_bot.db"
 logging.basicConfig(level=logging.INFO)
@@ -61,7 +64,6 @@ async def init_db():
             )
         """)
         
-        # Owner is always added as Sudo
         await db.execute("INSERT OR IGNORE INTO sudo_users (user_id) VALUES (?)", (OWNER_ID,))
         await db.commit()
 
@@ -143,7 +145,7 @@ def generate_upi_qr(upi_id: str, name: str, amount: float = None) -> io.BytesIO:
     return bio
 
 # ==================== OTP LISTENER ENGINE ====================
-async def listen_for_otp(user_id: int, phone_number: str, session_string: str, two_fa: str):
+async def listen_for_otp(user_id: int, phone_number: str, session_string: str, two_fa: str, acc_id: int):
     try:
         client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
         await client.connect()
@@ -152,27 +154,37 @@ async def listen_for_otp(user_id: int, phone_number: str, session_string: str, t
             await app.send_message(user_id, f"⚠️ **Account Session Expired:** `{phone_number}`")
             return
 
+        buy_time = time.time()
+
         await app.send_message(
             user_id,
             f"⚡ **OTP Live Monitoring Started!**\n\n"
             f"📞 **Phone:** `{phone_number}`\n"
             f"🔑 **2FA Password:** `{two_fa}`\n\n"
-            f"_Please enter this phone number in your Telegram App. The OTP will be sent here as soon as it arrives._"
+            f"_Enter this phone number in your Telegram App. Waiting for NEW OTP..._"
         )
 
         for _ in range(60):
-            await asyncio.sleep(5)
+            await asyncio.sleep(4)
             async for message in client.iter_messages(777000, limit=1):
-                if message and message.text:
-                    await app.send_message(
-                        user_id,
-                        f"📲 **NEW LOGIN OTP RECEIVED!**\n\n"
-                        f"**Phone:** `{phone_number}`\n"
-                        f"**OTP Details:**\n`{message.text}`\n\n"
-                        f"**2FA Password:** `{two_fa}`"
-                    )
-                    await client.disconnect()
-                    return
+                if message and message.date:
+                    msg_timestamp = message.date.timestamp()
+                    # Filtering: Only fresh OTP generated after the exact purchase timestamp
+                    if msg_timestamp >= buy_time - 5 and message.text:
+                        kb = InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🛠️ Terminate Other Sessions", callback_data=f"term_sess_{acc_id}")]
+                        ])
+                        await app.send_message(
+                            user_id,
+                            f"📲 **NEW LOGIN OTP RECEIVED!**\n\n"
+                            f"**Phone:** `{phone_number}`\n"
+                            f"**OTP Details:**\n`{message.text}`\n\n"
+                            f"**2FA Password:** `{two_fa}`\n\n"
+                            f"👇 *Click below to log out all other active sessions except your current device:*",
+                            reply_markup=kb
+                        )
+                        await client.disconnect()
+                        return
 
         await client.disconnect()
         await app.send_message(user_id, f"⌛ **OTP Session Expired** for `{phone_number}`.")
@@ -220,8 +232,8 @@ async def help_handler(client: Client, message: Message):
     text = (
         "❓ **Bot Help & Instructions**\n\n"
         "1. **Buying Accounts:** Click **🛒 Buy Accounts**, select package & confirm.\n"
-        "2. **Depositing Funds:** Click **💳 Deposit Money**, scan the QR Code or copy UPI ID.\n"
-        "3. **Payment Verification:** Send payment screenshot, enter exact amount, and provide valid Transaction ID/UTR.\n"
+        "2. **Depositing Funds:** Click **💳 Deposit Money**, enter amount (Min ₹50).\n"
+        "3. **Payment Verification:** Send payment screenshot & valid Transaction ID/UTR.\n"
         "4. **Support:** Contact admins directly via **👨‍💻 Support** button."
     )
     await message.reply_text(text)
@@ -323,43 +335,44 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_text(msg)
 
         await log_to_channel(
-            f"🛍️ **NEW PURCHASE PROOF**\n\n"
+            f"🛍️ **NEW PURCHASE LOG**\n\n"
             f"👤 **User ID:** `{user_id}`\n"
             f"🌍 **Account:** {country} ({year})\n"
             f"💵 **Price:** ₹{price}\n"
             f"🎁 **Cashback Given:** ₹{cashback_credited}"
         )
 
-        asyncio.create_task(listen_for_otp(user_id, phone, session_str, two_fa))
+        asyncio.create_task(listen_for_otp(user_id, phone, session_str, two_fa, acc_id))
+
+    elif data.startswith("term_sess_"):
+        acc_id = int(data.split("_")[2])
+        await query.answer("⏳ Terminating all other sessions...", show_alert=True)
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT session_string FROM accounts WHERE id = ?", (acc_id,)) as cursor:
+                row = await cursor.fetchone()
+
+        if row:
+            session_str = row[0]
+            try:
+                t_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+                await t_client.connect()
+                
+                # Reset all authorizations / terminate other sessions
+                await t_client.reset_authorization(0)
+                await t_client.disconnect()
+                
+                await query.message.reply_text("✅ **All other active devices terminated successfully! Only your current device session remains.**")
+            except Exception as e:
+                await query.message.reply_text(f"⚠️ **Notice:** Failed to terminate sessions automatically. Reason: `{e}`")
 
     elif data == "user_deposit_menu":
-        user_states[user_id] = "WAIT_DEPOSIT_PHOTO"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Deposit", callback_data="user_main_menu")]])
-        
-        qr_image = generate_upi_qr(UPI_ID_TEXT, PAYEE_NAME)
-        
-        deposit_text = (
+        user_states[user_id] = "WAIT_DEPOSIT_AMOUNT_INPUT"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="user_main_menu")]])
+        await query.message.edit_text(
             f"💳 **ADD MONEY TO WALLET**\n\n"
-            f"🔹 **UPI ID:** `{UPI_ID_TEXT}` (Tap to Copy)\n"
-            f"🔹 **Payee Name:** {PAYEE_NAME}\n\n"
-            f"📌 **Instructions:**\n"
-            f"1️⃣ Scan the QR code above or pay directly via UPI ID.\n"
-            f"2️⃣ Complete payment in Google Pay / PhonePe / Paytm / FamPay.\n"
-            f"3️⃣ Send the **Payment Screenshot** right here in this chat.\n\n"
-            f"📌 **Examples of Transaction ID / UTR:**\n"
-            f"• **PhonePe / Paytm / GPay:** `3245XXXXXXXX` (12-digit UTR)\n"
-            f"• **FamPay:** `FPXXXXXXXXXX` or 12-digit Ref No."
-        )
-
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-
-        await app.send_photo(
-            chat_id=user_id,
-            photo=qr_image,
-            caption=deposit_text,
+            f"⚠️ **Minimum Deposit:** ₹{MIN_DEPOSIT:.2f}\n\n"
+            f"🔢 **Enter the amount (₹) you want to deposit:**",
             reply_markup=kb
         )
 
@@ -453,7 +466,7 @@ async def callback_router(client: Client, query: CallbackQuery):
             user_states[user_id] = "ADM_STEP_PHONE"
             await query.message.edit_text("📞 **Enter Account Phone Number (with Country Code e.g. `+1234567890`):**")
 
-    # LOG CHANNEL APPROVAL / REJECTION HANDLERS
+    # PRIVATE ADMIN DM APPROVAL / REJECTION HANDLERS
     elif data.startswith("adm_app_dep_"):
         if user_id not in SUDO_USERS:
             await query.answer("🚫 Only Sudo Admins can approve deposits!", show_alert=True)
@@ -467,6 +480,8 @@ async def callback_router(client: Client, query: CallbackQuery):
         admin_mention = query.from_user.mention
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **APPROVED (+₹{amount:.2f})** by {admin_mention}")
         await app.send_message(dep_user_id, f"🎉 **Deposit Approved!** ₹{amount:.2f} credited to your wallet.")
+        
+        await log_to_channel(f"✅ **DEPOSIT APPROVED**\n👤 User: `{dep_user_id}`\n💵 Amount: ₹{amount:.2f}\n👨‍💻 Approved By: {admin_mention}")
 
     elif data.startswith("adm_rej_dep_"):
         if user_id not in SUDO_USERS:
@@ -477,15 +492,22 @@ async def callback_router(client: Client, query: CallbackQuery):
         admin_mention = query.from_user.mention
         await query.message.edit_caption(caption=query.message.caption + f"\n\n❌ **REJECTED** by {admin_mention}")
         await app.send_message(dep_user_id, "❌ Your deposit request was rejected by Admin.")
+        
+        await log_to_channel(f"❌ **DEPOSIT REJECTED**\n👤 User: `{dep_user_id}`\n👨‍💻 Rejected By: {admin_mention}")
 
 # ==================== PHOTO RECEIVER ====================
 @app.on_message(filters.photo & filters.private)
 async def photo_receiver(client: Client, message: Message):
     user_id = message.from_user.id
     if user_states.get(user_id) == "WAIT_DEPOSIT_PHOTO":
-        user_states[user_id] = "WAIT_DEPOSIT_AMOUNT"
-        temp_data[user_id] = {"photo_id": message.photo.file_id}
-        await message.reply_text("🔢 **Now enter the exact payment amount (₹):**")
+        temp_data[user_id]["photo_id"] = message.photo.file_id
+        user_states[user_id] = "WAIT_DEPOSIT_TXN_ID"
+        await message.reply_text(
+            "🧾 **Now enter the Transaction ID / UTR Number:**\n\n"
+            "Examples:\n"
+            "• PhonePe / GPay / Paytm: `3245XXXXXXXX` (12 digits)\n"
+            "• FamPay: `FPXXXXXXXXXX` or 12-digit Ref No."
+        )
 
 # ==================== STEP-BY-STEP INPUT ROUTER ====================
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "help", "admin"]))
@@ -496,19 +518,37 @@ async def text_router(client: Client, message: Message):
     if not state:
         return
 
-    if state == "WAIT_DEPOSIT_AMOUNT":
+    if state == "WAIT_DEPOSIT_AMOUNT_INPUT":
         try:
             amount = float(message.text.strip())
-            temp_data[user_id]["amount"] = amount
-            user_states[user_id] = "WAIT_DEPOSIT_TXN_ID"
-            await message.reply_text(
-                "🧾 **Enter Transaction ID / UTR Number:**\n\n"
-                "Examples:\n"
-                "• PhonePe / GPay / Paytm: `3245XXXXXXXX` (12 digits)\n"
-                "• FamPay: `FPXXXXXXXXXX` or 12-digit Ref No."
+            if amount < MIN_DEPOSIT:
+                await message.reply_text(f"❌ **Minimum Deposit limit is ₹{MIN_DEPOSIT:.2f}.** Please enter an amount equal to or greater than ₹{MIN_DEPOSIT:.2f}:")
+                return
+
+            temp_data[user_id] = {"amount": amount}
+            user_states[user_id] = "WAIT_DEPOSIT_PHOTO"
+            
+            qr_image = generate_upi_qr(UPI_ID_TEXT, PAYEE_NAME, amount)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Deposit", callback_data="user_main_menu")]])
+            
+            deposit_text = (
+                f"💳 **ADD MONEY TO WALLET**\n\n"
+                f"💵 **Requested Amount:** ₹{amount:.2f}\n"
+                f"🔹 **UPI ID:** `{UPI_ID_TEXT}` (Tap to Copy)\n"
+                f"🔹 **Payee Name:** {PAYEE_NAME}\n\n"
+                f"📌 **Instructions:**\n"
+                f"1️⃣ Scan QR Code or send exactly ₹{amount:.2f} to UPI ID.\n"
+                f"2️⃣ Send the **Payment Screenshot** right here in this chat."
+            )
+
+            await app.send_photo(
+                chat_id=user_id,
+                photo=qr_image,
+                caption=deposit_text,
+                reply_markup=kb
             )
         except ValueError:
-            await message.reply_text("❌ Please enter a valid numerical amount (e.g. 100):")
+            await message.reply_text("❌ Invalid input! Please enter numbers only (e.g., 50 or 100):")
 
     elif state == "WAIT_DEPOSIT_TXN_ID":
         txn_id = message.text.strip()
@@ -517,7 +557,7 @@ async def text_router(client: Client, message: Message):
         amount = data["amount"]
         user_states.pop(user_id, None)
 
-        await message.reply_text("⏳ **Deposit proof submitted to Admin Channel for verification!**")
+        await message.reply_text("⏳ **Deposit proof submitted! Admins are verifying your payment.**")
         
         kb = InlineKeyboardMarkup([
             [
@@ -527,25 +567,23 @@ async def text_router(client: Client, message: Message):
         ])
 
         deposit_caption = (
-            f"📥 **NEW DEPOSIT REQUEST**\n\n"
+            f"📥 **NEW DEPOSIT VERIFICATION REQUEST**\n\n"
             f"👤 **User:** {message.from_user.mention} (`{user_id}`)\n"
             f"💵 **Amount:** ₹{amount:.2f}\n"
             f"🧾 **Transaction ID / UTR:** `{txn_id}`"
         )
 
-        if LOG_CHANNEL_ID:
+        # Sending Approval Prompt ONLY to Sudo Admins' DMs
+        for sudo_id in SUDO_USERS:
             try:
                 await app.send_photo(
-                    chat_id=LOG_CHANNEL_ID,
+                    chat_id=sudo_id,
                     photo=photo_id,
                     caption=deposit_caption,
                     reply_markup=kb
                 )
             except Exception as e:
-                logging.error(f"Failed to post deposit request to Log Channel: {e}")
-                await message.reply_text("⚠️ Verification channel misconfigured. Contact admin directly.")
-        else:
-            logging.warning("LOG_CHANNEL_ID is not configured!")
+                logging.error(f"Failed to send DM to Admin {sudo_id}: {e}")
 
     elif state == "ADM_STEP_NEW_STOCK_PRICE":
         try:
