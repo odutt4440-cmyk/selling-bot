@@ -10,7 +10,7 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import SessionPasswordNeededError, FreshResetAuthorisationForbiddenError
 from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson.objectid import ObjectId
@@ -22,7 +22,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+# Supports both Channel or Group ID (-100xxxxxxxxx)
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", os.getenv("LOG_GROUP_ID", "0")))
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 UPI_ID_TEXT = os.getenv("UPI_ID_TEXT", "yourupi@bank")
@@ -98,12 +99,17 @@ async def remove_sudo_user(user_id: int):
     SUDO_USERS.discard(user_id)
     await sudo_col.delete_one({"user_id": user_id})
 
-async def log_to_channel(text: str):
+async def log_to_channel(text: str, reply_markup=None):
     if LOG_CHANNEL_ID:
         try:
-            await app.send_message(LOG_CHANNEL_ID, text)
+            await app.send_message(LOG_CHANNEL_ID, text, reply_markup=reply_markup)
         except Exception as e:
             logging.error(f"Log Channel Error: {e}")
+
+def get_buy_now_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 Buy Now", url="https://t.me/swastiktgs_bot")]
+    ])
 
 def generate_upi_qr(upi_id: str, name: str, amount: float = None) -> io.BytesIO:
     name_encoded = name.replace(" ", "%20")
@@ -143,6 +149,7 @@ async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
     phone_number = acc["phone_number"]
     session_string = acc["session_string"]
     two_fa = acc["two_fa"]
+    country = acc.get("country", "Global")
     
     try:
         t_client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
@@ -170,6 +177,17 @@ async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
                 f"⚠️ *Note: We are not responsible for any issues after receiving the OTP.*",
                 reply_markup=get_account_options_keyboard(acc_id)
             )
+            
+            # Send clean log to GC/Channel on OTP Received
+            log_text = (
+                f"✅ **New SMM Order Placed Successfully**\n\n"
+                f"➖ **Platform:** Telegram\n"
+                f"➖ **Service:** {country} Telegram Account 👥\n\n"
+                f"➕ **Status:** OTP Received Successfully\n"
+                f"➕ **Link:** https://t.me/••••••••"
+            )
+            await log_to_channel(log_text, reply_markup=get_buy_now_keyboard())
+
         elif is_manual:
             await app.send_message(
                 user_id,
@@ -390,14 +408,16 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         await query.message.edit_text(msg, reply_markup=get_account_options_keyboard(acc_id))
 
-        await log_to_channel(
-            f"🛍️ **NEW PURCHASE LOG**\n\n"
-            f"👤 **User ID:** `{user_id}`\n"
-            f"📁 **Category:** {category}\n"
-            f"🌍 **Account:** {country} ({year})\n"
-            f"💵 **Price:** ₹{price:.2f}\n"
-            f"🎁 **Cashback:** ₹{cashback:.2f}"
+        # Log to Channel / GC without showing User ID or sensitive data
+        log_text = (
+            f"✅ **New SMM Order Placed Successfully**\n\n"
+            f"➖ **Platform:** Telegram\n"
+            f"➖ **Service:** {country} Telegram Account ({year}) 👥\n\n"
+            f"➕ **Quantity:** 1 Account\n"
+            f"➕ **Price:** ₹{price:.2f}\n"
+            f"➕ **Link:** https://t.me/••••••••"
         )
+        await log_to_channel(log_text, reply_markup=get_buy_now_keyboard())
 
         asyncio.create_task(listen_for_otp(user_id, phone, session_str, two_fa, acc_id))
 
@@ -466,14 +486,18 @@ async def callback_router(client: Client, query: CallbackQuery):
                     try:
                         await t_client(ResetAuthorizationRequest(hash=auth.hash))
                         terminated_count += 1
+                    except FreshResetAuthorisationForbiddenError:
+                        await query.message.reply_text("⚠️ **Telegram Security Restriction:** New sessions cannot terminate other devices within 24 hours.")
+                        break
                     except Exception as err:
                         logging.error(f"Failed to terminate session hash {auth.hash}: {err}")
 
             await t_client.disconnect()
-            await query.message.reply_text(
-                f"✅ **Terminated {terminated_count} other sessions successfully!**",
-                reply_markup=get_account_options_keyboard(acc_id)
-            )
+            if terminated_count > 0:
+                await query.message.reply_text(
+                    f"✅ **Terminated {terminated_count} other sessions successfully!**",
+                    reply_markup=get_account_options_keyboard(acc_id)
+                )
 
         except Exception as e:
             await query.message.reply_text(f"❌ Failed to terminate other sessions: `{e}`")
@@ -593,14 +617,12 @@ async def callback_router(client: Client, query: CallbackQuery):
         parts = data.split("_")
         cat, country, year, price = parts[3], parts[4], parts[5], float(parts[6])
 
-        # Delete / Mark unavailable for users
         res = await accounts_col.delete_many(
             {"category": cat, "country": country, "year": year, "price": price, "status": "AVAILABLE"}
         )
 
         await query.answer(f"✅ Removed {res.deleted_count} items from stock!", show_alert=True)
 
-        # Refresh Remove Stock menu to update available lists
         pipeline = [
             {"$match": {"status": "AVAILABLE"}},
             {"$group": {
@@ -789,12 +811,15 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **APPROVED (+₹{amount:.2f})** by {admin_mention}")
         await app.send_message(dep_user_id, f"🎉 **Deposit Approved!** ₹{amount:.2f} credited to your wallet.")
         
-        await log_to_channel(
-            f"💳 **NEW DEPOSIT APPROVED**\n\n"
-            f"👤 **User ID:** `{dep_user_id}`\n"
-            f"💰 **Amount:** ₹{amount:.2f}\n"
-            f"👨‍💻 **Approved By:** {admin_mention}"
+        # Public Deposit log (hiding user ID/username as requested)
+        log_text = (
+            f"✅ **New SMM Order Placed Successfully**\n\n"
+            f"➖ **Platform:** Wallet Deposit\n"
+            f"➖ **Service:** Wallet Balance Added 💳\n\n"
+            f"➕ **Status:** Payment Approved\n"
+            f"➕ **Link:** https://t.me/••••••••"
         )
+        await log_to_channel(log_text, reply_markup=get_buy_now_keyboard())
 
     elif data.startswith("adm_rej_dep_"):
         if user_id not in SUDO_USERS: return
@@ -834,12 +859,14 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **WITHDRAW SUCCESSFUL! Money Sent.**")
         await app.send_message(w_user_id, f"🎉 **Withdrawal Successful!** ₹{amount:.2f} has been transferred to your QR code.")
 
-        await log_to_channel(
-            f"💸 **NEW WITHDRAWAL PROCESSED**\n\n"
-            f"👤 **User ID:** `{w_user_id}`\n"
-            f"💰 **Amount:** ₹{amount:.2f}\n"
-            f"✅ **Status:** Completed"
+        log_text = (
+            f"✅ **New SMM Order Placed Successfully**\n\n"
+            f"➖ **Platform:** Wallet Withdrawal\n"
+            f"➖ **Service:** Cashback Payout 💸\n\n"
+            f"➕ **Status:** Completed\n"
+            f"➕ **Link:** https://t.me/••••••••"
         )
+        await log_to_channel(log_text, reply_markup=get_buy_now_keyboard())
 
 # ==================== PHOTO RECEIVER ====================
 @app.on_message(filters.photo & filters.private)
