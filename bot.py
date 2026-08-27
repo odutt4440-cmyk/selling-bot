@@ -12,6 +12,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 from motor.motor_asyncio import AsyncIOMotorClient
+from bson.objectid import ObjectId
 
 # ==================== ENVIRONMENT CONFIGURATION ====================
 load_dotenv()
@@ -132,7 +133,6 @@ def get_account_options_keyboard(acc_id: str):
 
 # ==================== OTP LISTENER ENGINE ====================
 async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
-    from bson.objectid import ObjectId
     acc = await accounts_col.find_one({"_id": ObjectId(acc_id)})
 
     if not acc:
@@ -224,8 +224,14 @@ def get_main_menu_keyboard(user_id: int):
     return InlineKeyboardMarkup(buttons)
 
 def get_admin_panel_keyboard(user_id: int):
+    row_1 = [InlineKeyboardButton("➕ Add Account Stock", callback_data="admin_add_acc")]
+    
+    # PRICE CHANGE SIRF OWNER KE LIYE VISIBLE
+    if user_id == OWNER_ID:
+        row_1.append(InlineKeyboardButton("🏷️ Change Stock Price (Owner)", callback_data="admin_change_price"))
+
     buttons = [
-        [InlineKeyboardButton("➕ Add Account Stock", callback_data="admin_add_acc"), InlineKeyboardButton("🏷️ Change Stock Price", callback_data="admin_change_price")],
+        row_1,
         [InlineKeyboardButton("✏️ Edit User Balance", callback_data="admin_edit_bal"), InlineKeyboardButton("📢 Broadcast DM", callback_data="admin_broadcast")],
         [InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban_user"), InlineKeyboardButton("🟢 Unban User", callback_data="admin_unban_user")]
     ]
@@ -274,7 +280,6 @@ async def admin_command_handler(client: Client, message: Message):
 # ==================== CALLBACK ROUTER ====================
 @app.on_callback_query()
 async def callback_router(client: Client, query: CallbackQuery):
-    from bson.objectid import ObjectId
     user_id = query.from_user.id
     data = query.data
 
@@ -471,9 +476,12 @@ async def callback_router(client: Client, query: CallbackQuery):
         ])
         await query.message.edit_text("📂 **Select Account Category:**", reply_markup=kb)
 
-    # 1. EDIT PRICE VIA STOCK BUTTONS
+    # CHANGE PRICE - OWNER RESTRICTED
     elif data == "admin_change_price":
-        if user_id not in SUDO_USERS: return
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Only Owner can change stock prices!", show_alert=True)
+            return
+
         user_states.pop(user_id, None)
         pipeline = [
             {"$match": {"status": "AVAILABLE"}},
@@ -509,7 +517,10 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_text("🏷️ **Select Stock Item to Change Price:**", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("adm_chgprice_sel_"):
-        if user_id not in SUDO_USERS: return
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Only Owner can change stock prices!", show_alert=True)
+            return
+
         parts = data.split("_")
         cat, country, year = parts[3], parts[4], parts[5]
         
@@ -535,7 +546,7 @@ async def callback_router(client: Client, query: CallbackQuery):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
         )
 
-    # 2. MANAGE ADMINS BUTTON-BASED SYSTEM
+    # MANAGE ADMINS BUTTON-BASED SYSTEM
     elif data == "admin_manage_sudo":
         if user_id != OWNER_ID:
             await query.answer("🚫 Owner Only Access!", show_alert=True)
@@ -594,14 +605,18 @@ async def callback_router(client: Client, query: CallbackQuery):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
         )
 
-    # WITHDRAWAL AND DEPOSIT SINGLE APPROVAL ENGINE
+    # WITHDRAWAL AND DEPOSIT APPROVAL ENGINE (OBJECTID FIX INCLUDED)
     elif data.startswith("adm_app_dep_"):
         if user_id not in SUDO_USERS: return
         _, _, _, dep_user_id, amount, req_id = data.split("_")
         dep_user_id = int(dep_user_id)
         amount = float(amount)
 
-        res = await requests_col.find_one_and_update({"_id": req_id, "status": "PENDING"}, {"$set": {"status": "APPROVED"}})
+        res = await requests_col.find_one_and_update(
+            {"_id": ObjectId(req_id), "status": "PENDING"},
+            {"$set": {"status": "APPROVED"}}
+        )
+
         if not res:
             await query.answer("⚠️ Already processed by another admin!", show_alert=True)
             return
@@ -616,7 +631,11 @@ async def callback_router(client: Client, query: CallbackQuery):
         _, _, _, dep_user_id, req_id = data.split("_")
         dep_user_id = int(dep_user_id)
 
-        res = await requests_col.find_one_and_update({"_id": req_id, "status": "PENDING"}, {"$set": {"status": "REJECTED"}})
+        res = await requests_col.find_one_and_update(
+            {"_id": ObjectId(req_id), "status": "PENDING"},
+            {"$set": {"status": "REJECTED"}}
+        )
+
         if not res:
             await query.answer("⚠️ Already processed by another admin!", show_alert=True)
             return
@@ -633,7 +652,11 @@ async def callback_router(client: Client, query: CallbackQuery):
         w_user_id = int(w_user_id)
         amount = float(amount)
 
-        res = await requests_col.find_one_and_update({"_id": req_id, "status": "PENDING"}, {"$set": {"status": "APPROVED"}})
+        res = await requests_col.find_one_and_update(
+            {"_id": ObjectId(req_id), "status": "PENDING"},
+            {"$set": {"status": "APPROVED"}}
+        )
+
         if not res:
             await query.answer("⚠️ Request already actioned!", show_alert=True)
             return
@@ -764,6 +787,10 @@ async def text_router(client: Client, message: Message):
 
     # NEW PRICE INPUT PROCESSING
     elif state == "ADM_STEP_WAIT_NEW_PRICE":
+        if user_id != OWNER_ID:
+            await message.reply_text("🚫 Only Owner can change prices!")
+            return
+
         try:
             new_price = float(message.text.strip())
             c_info = temp_data[user_id]
