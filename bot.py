@@ -11,6 +11,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQ
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
+from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson.objectid import ObjectId
 
@@ -222,7 +223,6 @@ def get_admin_panel_keyboard(user_id: int):
 
     buttons = [row_1]
     
-    # Restrict Edit Balance to Owner Only
     if user_id == OWNER_ID:
         buttons.append([InlineKeyboardButton("✏️ Edit User Balance", callback_data="admin_edit_bal")])
         
@@ -394,6 +394,83 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
         asyncio.create_task(listen_for_otp(user_id, phone, session_str, two_fa, acc_id))
+
+    elif data.startswith("refetch_otp_"):
+        acc_id = data.split("_")[2]
+        await query.answer("🔄 Re-fetching latest OTP...", show_alert=False)
+        await fetch_latest_otp(user_id, acc_id, is_manual=True)
+
+    elif data.startswith("manage_devs_"):
+        acc_id = data.split("_")[2]
+        await query.answer("📱 Fetching Active Devices...", show_alert=False)
+        acc = await accounts_col.find_one({"_id": ObjectId(acc_id)})
+        
+        if not acc:
+            await query.message.reply_text("❌ **Account session record not found!**")
+            return
+
+        try:
+            t_client = TelegramClient(StringSession(acc["session_string"]), API_ID, API_HASH)
+            await t_client.connect()
+
+            if not await t_client.is_user_authorized():
+                await query.message.reply_text(f"⚠️ **Account Session Expired or Closed:** `{acc['phone_number']}`")
+                return
+
+            authorizations = await t_client(GetAuthorizationsRequest())
+            await t_client.disconnect()
+
+            dev_text = f"📱 **Active Devices List for** `{acc['phone_number']}`:\n\n"
+            for idx, auth in enumerate(authorizations.authorizations, 1):
+                current_mark = " (Current Session)" if auth.current else ""
+                dev_text += (
+                    f"**{idx}. {auth.device_model}**{current_mark}\n"
+                    f"▫️ **App:** {auth.app_name} ({auth.app_version})\n"
+                    f"▫️ **System:** {auth.platform} ({auth.system_version})\n"
+                    f"▫️ **IP / Location:** `{auth.ip}` ({auth.country})\n\n"
+                )
+
+            await query.message.reply_text(dev_text, reply_markup=get_account_options_keyboard(acc_id))
+
+        except Exception as e:
+            await query.message.reply_text(f"❌ Error fetching active devices: `{e}`")
+
+    elif data.startswith("term_sess_"):
+        acc_id = data.split("_")[2]
+        await query.answer("🛠️ Terminating other sessions...", show_alert=False)
+        acc = await accounts_col.find_one({"_id": ObjectId(acc_id)})
+        
+        if not acc:
+            await query.message.reply_text("❌ **Account session record not found!**")
+            return
+
+        try:
+            t_client = TelegramClient(StringSession(acc["session_string"]), API_ID, API_HASH)
+            await t_client.connect()
+
+            if not await t_client.is_user_authorized():
+                await query.message.reply_text(f"⚠️ **Account Session Expired or Closed:** `{acc['phone_number']}`")
+                return
+
+            authorizations = await t_client(GetAuthorizationsRequest())
+            terminated_count = 0
+            
+            for auth in authorizations.authorizations:
+                if not auth.current:
+                    try:
+                        await t_client(ResetAuthorizationRequest(hash=auth.hash))
+                        terminated_count += 1
+                    except Exception as err:
+                        logging.error(f"Failed to terminate session hash {auth.hash}: {err}")
+
+            await t_client.disconnect()
+            await query.message.reply_text(
+                f"✅ **Terminated {terminated_count} other sessions successfully!**",
+                reply_markup=get_account_options_keyboard(acc_id)
+            )
+
+        except Exception as e:
+            await query.message.reply_text(f"❌ Failed to terminate other sessions: `{e}`")
 
     elif data.startswith("logout_bot_"):
         acc_id = data.split("_")[2]
@@ -874,7 +951,6 @@ async def text_router(client: Client, message: Message):
         try:
             target_user = (await client.get_users(message.text.strip())).id
 
-            # Anti-Self/Admin Ban Check
             if target_user == OWNER_ID or target_user in SUDO_USERS:
                 await message.reply_text("❌ You cannot ban yourself or another admin.")
                 user_states.pop(user_id, None)
