@@ -12,6 +12,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQ
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
+from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
 
 # ==================== ENVIRONMENT CONFIGURATION ====================
 load_dotenv()
@@ -144,50 +145,92 @@ def generate_upi_qr(upi_id: str, name: str, amount: float = None) -> io.BytesIO:
     bio.seek(0)
     return bio
 
+def get_account_options_keyboard(acc_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Re-fetch OTP", callback_data=f"refetch_otp_{acc_id}")],
+        [InlineKeyboardButton("📱 Manage Devices", callback_data=f"manage_devs_{acc_id}")],
+        [InlineKeyboardButton("🛠️ Terminate Other Sessions", callback_data=f"term_sess_{acc_id}")],
+        [InlineKeyboardButton("🚪 Finish & Logout Bot", callback_data=f"logout_bot_{acc_id}")]
+    ])
+
 # ==================== OTP LISTENER ENGINE ====================
+async def fetch_latest_otp(user_id: int, acc_id: int, is_manual: bool = False):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT phone_number, session_string, two_fa FROM accounts WHERE id = ?", (acc_id,)) as cursor:
+            row = await cursor.fetchone()
+
+    if not row:
+        await app.send_message(user_id, "❌ **Account session record not found!**")
+        return
+
+    phone_number, session_string, two_fa = row
+    
+    try:
+        t_client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        await t_client.connect()
+
+        if not await t_client.is_user_authorized():
+            await app.send_message(user_id, f"⚠️ **Account Session Expired or Closed:** `{phone_number}`")
+            return
+
+        latest_otp = None
+        async for message in t_client.iter_messages(777000, limit=5):
+            if message and message.text:
+                latest_otp = message.text
+                break
+
+        await t_client.disconnect()
+
+        if latest_otp:
+            await app.send_message(
+                user_id,
+                f"📲 **NEW LOGIN OTP RECEIVED!**\n\n"
+                f"**Phone:** `{phone_number}`\n"
+                f"**OTP Details:**\n`{latest_otp}`\n\n"
+                f"**2FA Password:** `{two_fa}`\n\n"
+                f"⚠️ *Note: Ek baar OTP milne ke baad hum zimmedar nahi honge.*",
+                reply_markup=get_account_options_keyboard(acc_id)
+            )
+        elif is_manual:
+            await app.send_message(
+                user_id,
+                f"⌛ **No fresh OTP found yet for** `{phone_number}`. Re-send OTP in your app and click again.",
+                reply_markup=get_account_options_keyboard(acc_id)
+            )
+
+    except Exception as e:
+        logging.error(f"OTP Fetch Error: {e}")
+
 async def listen_for_otp(user_id: int, phone_number: str, session_string: str, two_fa: str, acc_id: int):
     try:
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        await client.connect()
+        t_client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        await t_client.connect()
 
-        if not await client.is_user_authorized():
+        if not await t_client.is_user_authorized():
             await app.send_message(user_id, f"⚠️ **Account Session Expired:** `{phone_number}`")
             return
 
         buy_time = time.time()
-
         await app.send_message(
             user_id,
             f"⚡ **OTP Live Monitoring Started!**\n\n"
             f"📞 **Phone:** `{phone_number}`\n"
             f"🔑 **2FA Password:** `{two_fa}`\n\n"
-            f"_Enter this phone number in your Telegram App. Waiting for NEW OTP..._"
+            f"_Enter phone number in Telegram app. Auto-checking OTP..._",
+            reply_markup=get_account_options_keyboard(acc_id)
         )
 
-        for _ in range(60):
-            await asyncio.sleep(4)
-            async for message in client.iter_messages(777000, limit=1):
+        for _ in range(30):
+            await asyncio.sleep(5)
+            async for message in t_client.iter_messages(777000, limit=1):
                 if message and message.date:
                     msg_timestamp = message.date.timestamp()
-                    # Filtering: Only fresh OTP generated after the exact purchase timestamp
                     if msg_timestamp >= buy_time - 5 and message.text:
-                        kb = InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🛠️ Terminate Other Sessions", callback_data=f"term_sess_{acc_id}")]
-                        ])
-                        await app.send_message(
-                            user_id,
-                            f"📲 **NEW LOGIN OTP RECEIVED!**\n\n"
-                            f"**Phone:** `{phone_number}`\n"
-                            f"**OTP Details:**\n`{message.text}`\n\n"
-                            f"**2FA Password:** `{two_fa}`\n\n"
-                            f"👇 *Click below to log out all other active sessions except your current device:*",
-                            reply_markup=kb
-                        )
-                        await client.disconnect()
+                        await t_client.disconnect()
+                        await fetch_latest_otp(user_id, acc_id, is_manual=False)
                         return
 
-        await client.disconnect()
-        await app.send_message(user_id, f"⌛ **OTP Session Expired** for `{phone_number}`.")
+        await t_client.disconnect()
     except Exception as e:
         logging.error(f"OTP Listener Error: {e}")
 
@@ -332,7 +375,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         if cashback_credited > 0:
             msg += f"🎁 **Cashback Added:** +₹{cashback_credited:.2f} credited to wallet!\n"
 
-        await query.message.edit_text(msg)
+        await query.message.edit_text(msg, reply_markup=get_account_options_keyboard(acc_id))
 
         await log_to_channel(
             f"🛍️ **NEW PURCHASE LOG**\n\n"
@@ -343,6 +386,65 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
         asyncio.create_task(listen_for_otp(user_id, phone, session_str, two_fa, acc_id))
+
+    elif data.startswith("refetch_otp_"):
+        acc_id = int(data.split("_")[2])
+        await query.answer("🔄 Re-fetching latest OTP...", show_alert=False)
+        await fetch_latest_otp(user_id, acc_id, is_manual=True)
+
+    elif data.startswith("manage_devs_"):
+        acc_id = int(data.split("_")[2])
+        await query.answer("📱 Fetching active devices...", show_alert=False)
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT session_string, phone_number FROM accounts WHERE id = ?", (acc_id,)) as cursor:
+                row = await cursor.fetchone()
+
+        if row:
+            session_str, phone = row
+            try:
+                t_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+                await t_client.connect()
+                authorizations = await t_client(GetAuthorizationsRequest())
+                await t_client.disconnect()
+
+                buttons = []
+                for auth in authorizations.authorizations:
+                    # Non-current sessions get individual termination buttons
+                    if not auth.current:
+                        device_label = f"❌ Remove: {auth.device_model} ({auth.app_name})"
+                        buttons.append([InlineKeyboardButton(device_label, callback_data=f"del_dev_{acc_id}_{auth.hash}")])
+                    else:
+                        buttons.append([InlineKeyboardButton(f"🟢 Current: {auth.device_model} (Bot)", callback_data="none")])
+
+                buttons.append([InlineKeyboardButton("🔙 Back to Options", callback_data=f"back_acc_opt_{acc_id}")])
+
+                await query.message.reply_text(
+                    f"📱 **Active Devices for** `{phone}`:\n\nClick any device to terminate session:",
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+
+            except Exception as e:
+                await query.message.reply_text(f"⚠️ Failed to list devices: `{e}`")
+
+    elif data.startswith("del_dev_"):
+        _, _, acc_id, auth_hash = data.split("_")
+        acc_id = int(acc_id)
+        auth_hash = int(auth_hash)
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT session_string FROM accounts WHERE id = ?", (acc_id,)) as cursor:
+                row = await cursor.fetchone()
+
+        if row:
+            try:
+                t_client = TelegramClient(StringSession(row[0]), API_ID, API_HASH)
+                await t_client.connect()
+                await t_client(ResetAuthorizationRequest(hash=auth_hash))
+                await t_client.disconnect()
+                await query.answer("✅ Device removed successfully!", show_alert=True)
+            except Exception as e:
+                await query.answer(f"❌ Device remove failed: {e}", show_alert=True)
 
     elif data.startswith("term_sess_"):
         acc_id = int(data.split("_")[2])
@@ -357,14 +459,32 @@ async def callback_router(client: Client, query: CallbackQuery):
             try:
                 t_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
                 await t_client.connect()
-                
-                # Reset all authorizations / terminate other sessions
                 await t_client.reset_authorization(0)
                 await t_client.disconnect()
-                
-                await query.message.reply_text("✅ **All other active devices terminated successfully! Only your current device session remains.**")
+                await query.message.reply_text("✅ **All other active devices terminated! Only your current device session remains.**")
             except Exception as e:
-                await query.message.reply_text(f"⚠️ **Notice:** Failed to terminate sessions automatically. Reason: `{e}`")
+                await query.message.reply_text(f"⚠️ **Notice:** Failed to terminate sessions. Reason: `{e}`")
+
+    elif data.startswith("logout_bot_"):
+        acc_id = int(data.split("_")[2])
+        await query.answer("🚪 Logging out bot session...", show_alert=True)
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT session_string FROM accounts WHERE id = ?", (acc_id,)) as cursor:
+                row = await cursor.fetchone()
+
+        if row:
+            try:
+                t_client = TelegramClient(StringSession(row[0]), API_ID, API_HASH)
+                await t_client.connect()
+                await t_client.log_out()
+                await query.message.reply_text("🚪 **Finish & Logout Complete! Bot session successfully deleted.**")
+            except Exception as e:
+                await query.message.reply_text(f"⚠️ Session already closed or error: `{e}`")
+
+    elif data.startswith("back_acc_opt_"):
+        acc_id = int(data.split("_")[3])
+        await query.message.edit_text("🛠️ **Account Options Panel:**", reply_markup=get_account_options_keyboard(acc_id))
 
     elif data == "user_deposit_menu":
         user_states[user_id] = "WAIT_DEPOSIT_AMOUNT_INPUT"
@@ -573,7 +693,6 @@ async def text_router(client: Client, message: Message):
             f"🧾 **Transaction ID / UTR:** `{txn_id}`"
         )
 
-        # Sending Approval Prompt ONLY to Sudo Admins' DMs
         for sudo_id in SUDO_USERS:
             try:
                 await app.send_photo(
@@ -663,35 +782,32 @@ async def text_router(client: Client, message: Message):
         t_client = data["client"]
         
         try:
-            await t_client.sign_in(data["phone"], otp)
+            try:
+                await t_client.sign_in(data["phone"], otp)
+            except SessionPasswordNeededError:
+                if data["two_fa"] and data["two_fa"] != "None":
+                    await t_client.sign_in(password=data["two_fa"])
+                else:
+                    await message.reply_text("❌ **2FA Password Required!**")
+                    await t_client.disconnect()
+                    return
+
             session_str = t_client.session.save()
             await t_client.disconnect()
 
             async with aiosqlite.connect(DB_NAME) as db:
                 await db.execute("""
-                    INSERT INTO accounts (country, year, price, has_discount, cashback, phone_number, session_string, two_fa)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO accounts 
+                    (country, year, price, has_discount, cashback, phone_number, session_string, two_fa, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'AVAILABLE')
                 """, (data["country"], data["year"], data["price"], data["has_discount"], data["cashback"], data["phone"], session_str, data["two_fa"]))
                 await db.commit()
 
             user_states.pop(user_id, None)
-            await message.reply_text(f"✅ **Account Added to Stock!**\n\n🌍 {data['country']} ({data['year']})\n📞 `{data['phone']}`", reply_markup=get_admin_panel_keyboard(user_id))
-        except SessionPasswordNeededError:
-            await t_client.sign_in(password=data["two_fa"])
-            session_str = t_client.session.save()
-            await t_client.disconnect()
+            await message.reply_text(f"✅ **Account Added / Updated in Stock!**\n\n🌍 {data['country']} ({data['year']})\n📞 `{data['phone']}`", reply_markup=get_admin_panel_keyboard(user_id))
 
-            async with aiosqlite.connect(DB_NAME) as db:
-                await db.execute("""
-                    INSERT INTO accounts (country, year, price, has_discount, cashback, phone_number, session_string, two_fa)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (data["country"], data["year"], data["price"], data["has_discount"], data["cashback"], data["phone"], session_str, data["two_fa"]))
-                await db.commit()
-
-            user_states.pop(user_id, None)
-            await message.reply_text(f"✅ **Account Added with 2FA Session!**", reply_markup=get_admin_panel_keyboard(user_id))
         except Exception as e:
-            await message.reply_text(f"❌ Error during sign in: {e}")
+            await message.reply_text(f"❌ Error during sign in: `{e}`")
 
     elif state == "ADM_STEP_BAL_USER":
         input_text = message.text.strip()
