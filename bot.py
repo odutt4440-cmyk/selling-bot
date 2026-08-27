@@ -220,11 +220,15 @@ def get_admin_panel_keyboard(user_id: int):
     if user_id == OWNER_ID:
         row_1.append(InlineKeyboardButton("🏷️ Change Stock Price (Owner)", callback_data="admin_change_price"))
 
-    buttons = [
-        row_1,
-        [InlineKeyboardButton("✏️ Edit User Balance", callback_data="admin_edit_bal"), InlineKeyboardButton("📢 Broadcast DM", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban_user"), InlineKeyboardButton("🟢 Unban User", callback_data="admin_unban_user")]
-    ]
+    buttons = [row_1]
+    
+    # Restrict Edit Balance to Owner Only
+    if user_id == OWNER_ID:
+        buttons.append([InlineKeyboardButton("✏️ Edit User Balance", callback_data="admin_edit_bal")])
+        
+    buttons.append([InlineKeyboardButton("📢 Broadcast DM", callback_data="admin_broadcast")])
+    buttons.append([InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban_user"), InlineKeyboardButton("🟢 Unban User", callback_data="admin_unban_user")])
+    
     if user_id == OWNER_ID:
         buttons.append([InlineKeyboardButton("👥 Manage Admins (Owner Only)", callback_data="admin_manage_sudo")])
     
@@ -332,9 +336,9 @@ async def callback_router(client: Client, query: CallbackQuery):
             cb = info["cashback"]
             count = s["count"]
 
-            btn_label = f"📁 [{cat}] {country} ({year}) - ₹{price} | Stock: {count}"
-            if cb > 0:
-                btn_label += f" (🎁 Cashback ₹{cb})"
+            cb_status = f"🎁 CB: ₹{cb}" if cb > 0 else "❌ No CB"
+            btn_label = f"📁 {cat} | {country} ({year}) | ₹{price} | {cb_status} | 📦 Stock: {count}"
+            
             buttons.append([InlineKeyboardButton(btn_label, callback_data=f"buy_cat_{cat}_{country}_{year}_{price}")])
         
         buttons.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")])
@@ -524,7 +528,9 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data == "admin_edit_bal":
-        if user_id not in SUDO_USERS: return
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Only Owner can edit balance!", show_alert=True)
+            return
         user_states[user_id] = "ADM_STEP_EDIT_BAL"
         await query.message.edit_text(
             "✏️ **EDIT USER BALANCE**\n\n"
@@ -612,7 +618,6 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **APPROVED (+₹{amount:.2f})** by {admin_mention}")
         await app.send_message(dep_user_id, f"🎉 **Deposit Approved!** ₹{amount:.2f} credited to your wallet.")
         
-        # Continuous Log to Channel
         await log_to_channel(
             f"💳 **NEW DEPOSIT APPROVED**\n\n"
             f"👤 **User ID:** `{dep_user_id}`\n"
@@ -812,6 +817,10 @@ async def text_router(client: Client, message: Message):
             await message.reply_text("❌ Price must be a valid number! Try again:")
 
     elif state == "ADM_STEP_EDIT_BAL":
+        if user_id != OWNER_ID:
+            await message.reply_text("🚫 Only Owner can edit balance!")
+            return
+
         try:
             parts = message.text.strip().split()
             if len(parts) != 2:
@@ -864,6 +873,13 @@ async def text_router(client: Client, message: Message):
     elif state == "ADM_STEP_BAN_ID":
         try:
             target_user = (await client.get_users(message.text.strip())).id
+
+            # Anti-Self/Admin Ban Check
+            if target_user == OWNER_ID or target_user in SUDO_USERS:
+                await message.reply_text("❌ Jhol alert! Aap khud ko ya kisi aur admin ko ban nahi kar sakte.")
+                user_states.pop(user_id, None)
+                return
+
             temp_data[user_id] = {"target_ban_user": target_user}
             user_states[user_id] = "ADM_STEP_BAN_REASON"
             await message.reply_text(f"👤 Target User ID: `{target_user}`\n\n📝 **Enter Reason for Ban:**")
