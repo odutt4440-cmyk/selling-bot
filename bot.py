@@ -166,7 +166,7 @@ async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
                 f"**Phone:** `{phone_number}`\n"
                 f"**OTP Details:**\n`{latest_otp}`\n\n"
                 f"**2FA Password:** `{two_fa}`\n\n"
-                f"⚠️ *Note: OTP milne ke baad humari koi zimmedari nahi hai.*",
+                f"⚠️ *Note: We are not responsible for any issues after receiving the OTP.*",
                 reply_markup=get_account_options_keyboard(acc_id)
             )
         elif is_manual:
@@ -189,15 +189,6 @@ async def listen_for_otp(user_id: int, phone_number: str, session_string: str, t
             return
 
         buy_time = time.time()
-        await app.send_message(
-            user_id,
-            f"⚡ **OTP Live Monitoring Started!**\n\n"
-            f"📞 **Phone:** `{phone_number}`\n"
-            f"🔑 **2FA Password:** `{two_fa}`\n\n"
-            f"_Enter phone number in Telegram app. Auto-checking OTP..._",
-            reply_markup=get_account_options_keyboard(acc_id)
-        )
-
         for _ in range(30):
             await asyncio.sleep(5)
             async for message in t_client.iter_messages(777000, limit=1):
@@ -226,7 +217,6 @@ def get_main_menu_keyboard(user_id: int):
 def get_admin_panel_keyboard(user_id: int):
     row_1 = [InlineKeyboardButton("➕ Add Account Stock", callback_data="admin_add_acc")]
     
-    # PRICE CHANGE SIRF OWNER KE LIYE VISIBLE
     if user_id == OWNER_ID:
         row_1.append(InlineKeyboardButton("🏷️ Change Stock Price (Owner)", callback_data="admin_change_price"))
 
@@ -241,7 +231,6 @@ def get_admin_panel_keyboard(user_id: int):
     buttons.append([InlineKeyboardButton("🔙 Exit Admin Panel", callback_data="user_main_menu")])
     return InlineKeyboardMarkup(buttons)
 
-# Helper function for Manage Admins menu
 async def get_manage_sudo_keyboard():
     buttons = [
         [InlineKeyboardButton("➕ Add Admin", callback_data="adm_add_sudo_btn")]
@@ -378,16 +367,16 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         await update_balance(user_id, -price)
 
-        msg = f"✅ **Purchase Successful!**\n\n" \
-              f"📁 **Category:** {category}\n" \
-              f"🌍 **Country:** {country} ({year})\n" \
-              f"📞 **Phone Number:** `{phone}`\n" \
+        msg = f"⚡ **OTP Live Monitoring Started!**\n\n" \
+              f"📞 **Phone:** `{phone}`\n" \
               f"🔑 **2FA Password:** `{two_fa}`\n" \
-              f"💵 **Price Paid:** ₹{price}\n"
+              f"💵 **Price Paid:** ₹{price:.2f}\n"
 
         if cashback > 0:
             temp_data[user_id] = {"pending_cashback": cashback, "acc_id": acc_id}
-            msg += f"\n🎁 **Cashback Earned:** ₹{cashback:.2f}! *(Finish & Logout ke baad choice milegi)*\n"
+            msg += f"\n🎁 **Cashback Earned:** ₹{cashback:.2f}! *(Options available after Finish & Logout process)*\n"
+
+        msg += "\n_Enter phone number in Telegram app. Auto-checking OTP..._"
 
         await query.message.edit_text(msg, reply_markup=get_account_options_keyboard(acc_id))
 
@@ -396,8 +385,8 @@ async def callback_router(client: Client, query: CallbackQuery):
             f"👤 **User ID:** `{user_id}`\n"
             f"📁 **Category:** {category}\n"
             f"🌍 **Account:** {country} ({year})\n"
-            f"💵 **Price:** ₹{price}\n"
-            f"🎁 **Cashback:** ₹{cashback}"
+            f"💵 **Price:** ₹{price:.2f}\n"
+            f"🎁 **Cashback:** ₹{cashback:.2f}"
         )
 
         asyncio.create_task(listen_for_otp(user_id, phone, session_str, two_fa, acc_id))
@@ -426,7 +415,7 @@ async def callback_router(client: Client, query: CallbackQuery):
             ])
             await app.send_message(
                 user_id,
-                f"🎉 **You have purchased the cashback account!**\n\n"
+                f"🎉 **You have earned cashback on your purchase!**\n\n"
                 f"🎁 **Cashback Amount:** ₹{cb_val:.2f}\n"
                 f"Where would you like to add your cashback rewards?",
                 reply_markup=kb
@@ -476,7 +465,6 @@ async def callback_router(client: Client, query: CallbackQuery):
         ])
         await query.message.edit_text("📂 **Select Account Category:**", reply_markup=kb)
 
-    # CHANGE PRICE - OWNER RESTRICTED
     elif data == "admin_change_price":
         if user_id != OWNER_ID:
             await query.answer("🚫 Only Owner can change stock prices!", show_alert=True)
@@ -546,7 +534,6 @@ async def callback_router(client: Client, query: CallbackQuery):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
         )
 
-    # MANAGE ADMINS BUTTON-BASED SYSTEM
     elif data == "admin_manage_sudo":
         if user_id != OWNER_ID:
             await query.answer("🚫 Owner Only Access!", show_alert=True)
@@ -605,7 +592,6 @@ async def callback_router(client: Client, query: CallbackQuery):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
         )
 
-    # WITHDRAWAL AND DEPOSIT APPROVAL ENGINE (OBJECTID FIX INCLUDED)
     elif data.startswith("adm_app_dep_"):
         if user_id not in SUDO_USERS: return
         _, _, _, dep_user_id, amount, req_id = data.split("_")
@@ -625,6 +611,14 @@ async def callback_router(client: Client, query: CallbackQuery):
         admin_mention = query.from_user.mention
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **APPROVED (+₹{amount:.2f})** by {admin_mention}")
         await app.send_message(dep_user_id, f"🎉 **Deposit Approved!** ₹{amount:.2f} credited to your wallet.")
+        
+        # Continuous Log to Channel
+        await log_to_channel(
+            f"💳 **NEW DEPOSIT APPROVED**\n\n"
+            f"👤 **User ID:** `{dep_user_id}`\n"
+            f"💰 **Amount:** ₹{amount:.2f}\n"
+            f"👨‍💻 **Approved By:** {admin_mention}"
+        )
 
     elif data.startswith("adm_rej_dep_"):
         if user_id not in SUDO_USERS: return
@@ -663,6 +657,13 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **WITHDRAW SUCCESSFUL! Money Sent.**")
         await app.send_message(w_user_id, f"🎉 **Withdrawal Successful!** ₹{amount:.2f} has been transferred to your QR code.")
+
+        await log_to_channel(
+            f"💸 **NEW WITHDRAWAL PROCESSED**\n\n"
+            f"👤 **User ID:** `{w_user_id}`\n"
+            f"💰 **Amount:** ₹{amount:.2f}\n"
+            f"✅ **Status:** Completed"
+        )
 
 # ==================== PHOTO RECEIVER ====================
 @app.on_message(filters.photo & filters.private)
@@ -785,7 +786,6 @@ async def text_router(client: Client, message: Message):
             except Exception as e:
                 logging.error(f"Failed sending DM to Admin {sudo_id}: {e}")
 
-    # NEW PRICE INPUT PROCESSING
     elif state == "ADM_STEP_WAIT_NEW_PRICE":
         if user_id != OWNER_ID:
             await message.reply_text("🚫 Only Owner can change prices!")
@@ -811,7 +811,6 @@ async def text_router(client: Client, message: Message):
         except ValueError:
             await message.reply_text("❌ Price must be a valid number! Try again:")
 
-    # ADMIN PANEL: EDIT BALANCE
     elif state == "ADM_STEP_EDIT_BAL":
         try:
             parts = message.text.strip().split()
@@ -831,7 +830,6 @@ async def text_router(client: Client, message: Message):
         except ValueError:
             await message.reply_text("❌ Check your input numbers!")
 
-    # ADMIN INPUT FOR ADDING SUDO
     elif state == "ADM_STEP_INPUT_ADD_SUDO":
         if user_id != OWNER_ID: return
         try:
@@ -843,7 +841,6 @@ async def text_router(client: Client, message: Message):
         except ValueError:
             await message.reply_text("❌ Invalid User ID! Enter numbers only:")
 
-    # ADMIN PANEL: BROADCAST HANDLER
     elif state == "ADM_STEP_BROADCAST":
         user_states.pop(user_id, None)
         broadcast_msg = message.text
@@ -864,7 +861,6 @@ async def text_router(client: Client, message: Message):
 
         await message.reply_text(f"✅ **Broadcast Completed!**\n\n🟢 Delivered: {success}\n🔴 Failed: {failed}", reply_markup=get_admin_panel_keyboard(user_id))
 
-    # ADMIN PANEL: BAN / UNBAN
     elif state == "ADM_STEP_BAN_ID":
         try:
             target_user = (await client.get_users(message.text.strip())).id
@@ -900,7 +896,6 @@ async def text_router(client: Client, message: Message):
         except Exception:
             await message.reply_text("❌ Invalid User ID or Username:")
 
-    # ACCOUNT ADDITION FLOW
     elif state == "ADM_STEP_COUNTRY":
         temp_data[user_id]["country"] = message.text.strip()
         user_states[user_id] = "ADM_STEP_YEAR"
