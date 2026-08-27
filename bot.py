@@ -216,12 +216,18 @@ def get_main_menu_keyboard(user_id: int):
     return InlineKeyboardMarkup(buttons)
 
 def get_admin_panel_keyboard(user_id: int):
-    row_1 = [InlineKeyboardButton("➕ Add Account Stock", callback_data="admin_add_acc")]
+    row_1 = [
+        InlineKeyboardButton("➕ Add Account Stock", callback_data="admin_add_acc"),
+        InlineKeyboardButton("🗑️ Remove Stock", callback_data="admin_remove_stock")
+    ]
     
+    row_2 = []
     if user_id == OWNER_ID:
-        row_1.append(InlineKeyboardButton("🏷️ Change Stock Price (Owner)", callback_data="admin_change_price"))
+        row_2.append(InlineKeyboardButton("🏷️ Change Price (Owner)", callback_data="admin_change_price"))
 
     buttons = [row_1]
+    if row_2:
+        buttons.append(row_2)
     
     if user_id == OWNER_ID:
         buttons.append([InlineKeyboardButton("✏️ Edit User Balance", callback_data="admin_edit_bal")])
@@ -545,6 +551,94 @@ async def callback_router(client: Client, query: CallbackQuery):
             [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
         ])
         await query.message.edit_text("📂 **Select Account Category:**", reply_markup=kb)
+
+    elif data == "admin_remove_stock":
+        if user_id not in SUDO_USERS: return
+        
+        pipeline = [
+            {"$match": {"status": "AVAILABLE"}},
+            {"$group": {
+                "_id": {
+                    "category": "$category",
+                    "country": "$country",
+                    "year": "$year",
+                    "price": "$price"
+                },
+                "count": {"$sum": 1}
+            }}
+        ]
+        stocks = await accounts_col.aggregate(pipeline).to_list(length=100)
+
+        if not stocks:
+            await query.answer("❌ Current mein koi active stock available nahi hai!", show_alert=True)
+            return
+
+        buttons = []
+        for s in stocks:
+            info = s["_id"]
+            cat = info.get("category", "General")
+            country = info["country"]
+            year = info["year"]
+            price = info["price"]
+            count = s["count"]
+
+            btn_label = f"🗑️ Delete [{cat}] {country} ({year}) | ₹{price} | 📦 Count: {count}"
+            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"adm_rmstock_confirm_{cat}_{country}_{year}_{price}")])
+
+        buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
+        await query.message.edit_text("🗑️ **Select Stock Item to Remove/Delete:**\n\n*(Is button par click karte hi yeh stock users list se turant automatically hide ho jayega)*", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("adm_rmstock_confirm_"):
+        if user_id not in SUDO_USERS: return
+        parts = data.split("_")
+        cat, country, year, price = parts[3], parts[4], parts[5], float(parts[6])
+
+        # Delete / Mark unavailable for users
+        res = await accounts_col.delete_many(
+            {"category": cat, "country": country, "year": year, "price": price, "status": "AVAILABLE"}
+        )
+
+        await query.answer(f"✅ Removed {res.deleted_count} items from stock!", show_alert=True)
+
+        # Refresh Remove Stock menu to update available lists
+        pipeline = [
+            {"$match": {"status": "AVAILABLE"}},
+            {"$group": {
+                "_id": {
+                    "category": "$category",
+                    "country": "$country",
+                    "year": "$year",
+                    "price": "$price"
+                },
+                "count": {"$sum": 1}
+            }}
+        ]
+        stocks = await accounts_col.aggregate(pipeline).to_list(length=100)
+
+        if not stocks:
+            await query.message.edit_text(
+                "✅ **All active stock items have been cleared.**",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+            )
+            return
+
+        buttons = []
+        for s in stocks:
+            info = s["_id"]
+            cat_n = info.get("category", "General")
+            c_n = info["country"]
+            y_n = info["year"]
+            p_n = info["price"]
+            count_n = s["count"]
+
+            btn_label = f"🗑️ Delete [{cat_n}] {c_n} ({y_n}) | ₹{p_n} | 📦 Count: {count_n}"
+            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"adm_rmstock_confirm_{cat_n}_{c_n}_{y_n}_{p_n}")])
+
+        buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
+        await query.message.edit_text(
+            f"✅ **Stock removed successfully! ({res.deleted_count} items deleted)**\n\nSelect another stock to remove:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
 
     elif data == "admin_change_price":
         if user_id != OWNER_ID:
