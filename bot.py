@@ -235,6 +235,19 @@ def get_admin_panel_keyboard(user_id: int):
     buttons.append([InlineKeyboardButton("🔙 Exit Admin Panel", callback_data="user_main_menu")])
     return InlineKeyboardMarkup(buttons)
 
+# Helper function for Manage Admins menu
+async def get_manage_sudo_keyboard():
+    buttons = [
+        [InlineKeyboardButton("➕ Add Admin", callback_data="adm_add_sudo_btn")]
+    ]
+    sudo_docs = await sudo_col.find({"user_id": {"$ne": OWNER_ID}}).to_list(length=100)
+    for doc in sudo_docs:
+        s_id = doc["user_id"]
+        buttons.append([InlineKeyboardButton(f"❌ Remove {s_id}", callback_data=f"adm_rem_sudo_{s_id}")])
+    
+    buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(buttons)
+
 # ==================== COMMAND HANDLERS ====================
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
@@ -458,14 +471,56 @@ async def callback_router(client: Client, query: CallbackQuery):
         ])
         await query.message.edit_text("📂 **Select Account Category:**", reply_markup=kb)
 
+    # 1. EDIT PRICE VIA STOCK BUTTONS
     elif data == "admin_change_price":
         if user_id not in SUDO_USERS: return
-        user_states[user_id] = "ADM_STEP_CHG_PRICE_CAT"
+        user_states.pop(user_id, None)
+        pipeline = [
+            {"$match": {"status": "AVAILABLE"}},
+            {"$group": {
+                "_id": {
+                    "category": "$category",
+                    "country": "$country",
+                    "year": "$year",
+                    "price": "$price"
+                },
+                "count": {"$sum": 1}
+            }}
+        ]
+        stocks = await accounts_col.aggregate(pipeline).to_list(length=100)
+
+        if not stocks:
+            await query.answer("❌ No Stock Available to change price!", show_alert=True)
+            return
+
+        buttons = []
+        for s in stocks:
+            info = s["_id"]
+            cat = info.get("category", "General")
+            country = info["country"]
+            year = info["year"]
+            price = info["price"]
+            count = s["count"]
+
+            btn_label = f"📁 [{cat}] {country} ({year}) - Current: ₹{price} | Stock: {count}"
+            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"adm_chgprice_sel_{cat}_{country}_{year}")])
+
+        buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
+        await query.message.edit_text("🏷️ **Select Stock Item to Change Price:**", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("adm_chgprice_sel_"):
+        if user_id not in SUDO_USERS: return
+        parts = data.split("_")
+        cat, country, year = parts[3], parts[4], parts[5]
+        
+        temp_data[user_id] = {"chg_cat": cat, "chg_country": country, "chg_year": year}
+        user_states[user_id] = "ADM_STEP_WAIT_NEW_PRICE"
+
         await query.message.edit_text(
-            "🏷️ **CHANGE STOCK PRICE**\n\n"
-            "Enter Category, Country, Year & New Price separated by commas.\n"
-            "Format: `Category, Country, Year, NewPrice`\n"
-            "Example: `Fresh Account, India, 2024, 150`",
+            f"🏷️ **Changing Price for:**\n"
+            f"📁 Category: `{cat}`\n"
+            f"🌍 Item: `{country} ({year})`\n\n"
+            f"🔢 **Enter the new Price (in ₹):**",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
         )
 
@@ -480,17 +535,30 @@ async def callback_router(client: Client, query: CallbackQuery):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
         )
 
+    # 2. MANAGE ADMINS BUTTON-BASED SYSTEM
     elif data == "admin_manage_sudo":
         if user_id != OWNER_ID:
             await query.answer("🚫 Owner Only Access!", show_alert=True)
             return
-        user_states[user_id] = "ADM_STEP_MANAGE_SUDO"
+        user_states.pop(user_id, None)
+        kb = await get_manage_sudo_keyboard()
+        await query.message.edit_text("👥 **MANAGE ADMINS**\n\nClick **➕ Add Admin** or click on any existing Admin ID to **Remove** them:", reply_markup=kb)
+
+    elif data == "adm_add_sudo_btn":
+        if user_id != OWNER_ID: return
+        user_states[user_id] = "ADM_STEP_INPUT_ADD_SUDO"
         await query.message.edit_text(
-            "👥 **MANAGE ADMINS**\n\n"
-            "Send `add UserID` to add an admin or `remove UserID` to revoke admin privileges.\n"
-            "Examples:\n`add 123456789`\n`remove 123456789`",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+            "➕ **ADD NEW ADMIN**\n\nSend the **Telegram User ID** of the person you want to make Admin:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Manage Admins", callback_data="admin_manage_sudo")]])
         )
+
+    elif data.startswith("adm_rem_sudo_"):
+        if user_id != OWNER_ID: return
+        target_id = int(data.split("_")[3])
+        await remove_sudo_user(target_id)
+        await query.answer(f"🗑️ Removed Admin {target_id}", show_alert=True)
+        kb = await get_manage_sudo_keyboard()
+        await query.message.edit_text("👥 **MANAGE ADMINS**\n\nClick **➕ Add Admin** or click on any existing Admin ID to **Remove** them:", reply_markup=kb)
 
     elif data.startswith("adm_cat_"):
         if user_id not in SUDO_USERS: return
@@ -694,28 +762,27 @@ async def text_router(client: Client, message: Message):
             except Exception as e:
                 logging.error(f"Failed sending DM to Admin {sudo_id}: {e}")
 
-    # ADMIN PANEL: CHANGE STOCK PRICE
-    elif state == "ADM_STEP_CHG_PRICE_CAT":
+    # NEW PRICE INPUT PROCESSING
+    elif state == "ADM_STEP_WAIT_NEW_PRICE":
         try:
-            raw_input = [i.strip() for i in message.text.split(",")]
-            if len(raw_input) != 4:
-                await message.reply_text("❌ Invalid Format! Use: `Category, Country, Year, NewPrice`")
-                return
-            
-            cat, country, year, new_price = raw_input[0], raw_input[1], raw_input[2], float(raw_input[3])
-            
+            new_price = float(message.text.strip())
+            c_info = temp_data[user_id]
+            cat, country, year = c_info["chg_cat"], c_info["chg_country"], c_info["chg_year"]
+
             res = await accounts_col.update_many(
                 {"category": cat, "country": country, "year": year, "status": "AVAILABLE"},
                 {"$set": {"price": new_price}}
             )
 
             user_states.pop(user_id, None)
+            temp_data.pop(user_id, None)
+
             await message.reply_text(
-                f"✅ **Price Updated!**\n\nUpdated {res.modified_count} available accounts in category `{cat}` ({country} {year}) to ₹{new_price:.2f}.",
+                f"✅ **Price Updated!**\n\nUpdated price for `{cat}` ({country} {year}) to **₹{new_price:.2f}** ({res.modified_count} accounts affected).",
                 reply_markup=get_admin_panel_keyboard(user_id)
             )
         except ValueError:
-            await message.reply_text("❌ Price must be a valid number!")
+            await message.reply_text("❌ Price must be a valid number! Try again:")
 
     # ADMIN PANEL: EDIT BALANCE
     elif state == "ADM_STEP_EDIT_BAL":
@@ -737,22 +804,17 @@ async def text_router(client: Client, message: Message):
         except ValueError:
             await message.reply_text("❌ Check your input numbers!")
 
-    # ADMIN PANEL: MANAGE SUDO
-    elif state == "ADM_STEP_MANAGE_SUDO":
+    # ADMIN INPUT FOR ADDING SUDO
+    elif state == "ADM_STEP_INPUT_ADD_SUDO":
         if user_id != OWNER_ID: return
-        parts = message.text.strip().split()
-        if len(parts) != 2 or parts[0].lower() not in ["add", "remove"]:
-            await message.reply_text("❌ Invalid command format! Use `add UserID` or `remove UserID`")
-            return
-
-        action, target_id = parts[0].lower(), int(parts[1])
-        if action == "add":
+        try:
+            target_id = int(message.text.strip())
             await add_sudo_user(target_id)
-            await message.reply_text(f"✅ User `{target_id}` added to Admins list.", reply_markup=get_admin_panel_keyboard(user_id))
-        else:
-            await remove_sudo_user(target_id)
-            await message.reply_text(f"🗑️ User `{target_id}` removed from Admins list.", reply_markup=get_admin_panel_keyboard(user_id))
-        user_states.pop(user_id, None)
+            user_states.pop(user_id, None)
+            kb = await get_manage_sudo_keyboard()
+            await message.reply_text(f"✅ User `{target_id}` added to Admins!", reply_markup=kb)
+        except ValueError:
+            await message.reply_text("❌ Invalid User ID! Enter numbers only:")
 
     # ADMIN PANEL: BROADCAST HANDLER
     elif state == "ADM_STEP_BROADCAST":
