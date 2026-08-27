@@ -3,7 +3,6 @@ import io
 import os
 import logging
 import time
-import aiosqlite
 import qrcode
 from dotenv import load_dotenv
 
@@ -13,6 +12,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # ==================== ENVIRONMENT CONFIGURATION ====================
 load_dotenv()
@@ -23,55 +23,32 @@ API_HASH = os.getenv("API_HASH")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 UPI_ID_TEXT = os.getenv("UPI_ID_TEXT", "yourupi@bank")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "Account Store")
 
 MIN_DEPOSIT = 50.0
+MIN_WITHDRAW = 50.0
 
-DB_NAME = "shop_bot.db"
 logging.basicConfig(level=logging.INFO)
+
+# ==================== MONGO DB INITIALIZATION ====================
+mongo_client = AsyncIOMotorClient(MONGO_URI)
+db = mongo_client["shop_bot_db"]
+
+users_col = db["users"]
+accounts_col = db["accounts"]
+sudo_col = db["sudo_users"]
+requests_col = db["requests"]  # Active transaction locks
 
 SUDO_USERS = set()
 
-# ==================== DATABASE INITIALIZATION ====================
 async def init_db():
     global SUDO_USERS
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                balance REAL DEFAULT 0.0,
-                is_banned INTEGER DEFAULT 0
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                country TEXT,
-                year TEXT,
-                phone_number TEXT UNIQUE,
-                session_string TEXT,
-                two_fa TEXT DEFAULT 'None',
-                price REAL,
-                has_discount TEXT DEFAULT 'NO',
-                cashback REAL DEFAULT 0.0,
-                status TEXT DEFAULT 'AVAILABLE',
-                sold_to INTEGER DEFAULT NULL
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS sudo_users (
-                user_id INTEGER PRIMARY KEY
-            )
-        """)
-        
-        await db.execute("INSERT OR IGNORE INTO sudo_users (user_id) VALUES (?)", (OWNER_ID,))
-        await db.commit()
-
-        async with db.execute("SELECT user_id FROM sudo_users") as cursor:
-            rows = await cursor.fetchall()
-            SUDO_USERS = {r[0] for r in rows}
-            SUDO_USERS.add(OWNER_ID)
+    await sudo_col.update_one({"user_id": OWNER_ID}, {"$set": {"user_id": OWNER_ID}}, upsert=True)
+    sudo_docs = await sudo_col.find().to_list(length=1000)
+    SUDO_USERS = {doc["user_id"] for doc in sudo_docs}
+    SUDO_USERS.add(OWNER_ID)
 
 # ==================== BOT CLIENT SETUP ====================
 app = Client("ShopBotGUI", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -79,46 +56,46 @@ app = Client("ShopBotGUI", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN
 user_states = {}
 temp_data = {}
 
-# ==================== HELPER FUNCTIONS ====================
-async def get_user_balance(user_id: int) -> float:
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return row[0]
-            await db.execute("INSERT INTO users (user_id, balance) VALUES (?, 0.0)", (user_id,))
-            await db.commit()
-            return 0.0
+# ==================== HELPER DB FUNCTIONS ====================
+async def get_user_data(user_id: int):
+    user = await users_col.find_one({"user_id": user_id})
+    if not user:
+        user = {
+            "user_id": user_id,
+            "balance": 0.0,
+            "profile_cashback": 0.0,
+            "is_banned": False,
+            "ban_reason": ""
+        }
+        await users_col.insert_one(user)
+    return user
 
-async def is_banned(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            return bool(row[0]) if row else False
+async def get_user_balance(user_id: int) -> float:
+    user = await get_user_data(user_id)
+    return user.get("balance", 0.0)
+
+async def is_banned(user_id: int) -> tuple[bool, str]:
+    user = await get_user_data(user_id)
+    return user.get("is_banned", False), user.get("ban_reason", "")
 
 async def set_user_balance(user_id: int, new_balance: float):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO users (user_id, balance) VALUES (?, ?)", (user_id, new_balance))
-        await db.commit()
+    await users_col.update_one({"user_id": user_id}, {"$set": {"balance": new_balance}}, upsert=True)
 
 async def update_balance(user_id: int, amount: float):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-        await db.commit()
+    await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": amount}}, upsert=True)
+
+async def update_profile_cashback(user_id: int, amount: float):
+    await users_col.update_one({"user_id": user_id}, {"$inc": {"profile_cashback": amount}}, upsert=True)
 
 async def add_sudo_user(user_id: int):
     SUDO_USERS.add(user_id)
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR IGNORE INTO sudo_users (user_id) VALUES (?)", (user_id,))
-        await db.commit()
+    await sudo_col.update_one({"user_id": user_id}, {"$set": {"user_id": user_id}}, upsert=True)
 
 async def remove_sudo_user(user_id: int):
     if user_id == OWNER_ID:
         return
     SUDO_USERS.discard(user_id)
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM sudo_users WHERE user_id = ?", (user_id,))
-        await db.commit()
+    await sudo_col.delete_one({"user_id": user_id})
 
 async def log_to_channel(text: str):
     if LOG_CHANNEL_ID:
@@ -145,7 +122,7 @@ def generate_upi_qr(upi_id: str, name: str, amount: float = None) -> io.BytesIO:
     bio.seek(0)
     return bio
 
-def get_account_options_keyboard(acc_id: int):
+def get_account_options_keyboard(acc_id: str):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Re-fetch OTP", callback_data=f"refetch_otp_{acc_id}")],
         [InlineKeyboardButton("📱 Manage Devices", callback_data=f"manage_devs_{acc_id}")],
@@ -154,16 +131,17 @@ def get_account_options_keyboard(acc_id: int):
     ])
 
 # ==================== OTP LISTENER ENGINE ====================
-async def fetch_latest_otp(user_id: int, acc_id: int, is_manual: bool = False):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT phone_number, session_string, two_fa FROM accounts WHERE id = ?", (acc_id,)) as cursor:
-            row = await cursor.fetchone()
+async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
+    from bson.objectid import ObjectId
+    acc = await accounts_col.find_one({"_id": ObjectId(acc_id)})
 
-    if not row:
+    if not acc:
         await app.send_message(user_id, "❌ **Account session record not found!**")
         return
 
-    phone_number, session_string, two_fa = row
+    phone_number = acc["phone_number"]
+    session_string = acc["session_string"]
+    two_fa = acc["two_fa"]
     
     try:
         t_client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
@@ -188,20 +166,20 @@ async def fetch_latest_otp(user_id: int, acc_id: int, is_manual: bool = False):
                 f"**Phone:** `{phone_number}`\n"
                 f"**OTP Details:**\n`{latest_otp}`\n\n"
                 f"**2FA Password:** `{two_fa}`\n\n"
-                f"⚠️ *Note: Ek baar OTP milne ke baad hum zimmedar nahi honge.*",
+                f"⚠️ *Note: OTP milne ke baad humari koi zimmedari nahi hai.*",
                 reply_markup=get_account_options_keyboard(acc_id)
             )
         elif is_manual:
             await app.send_message(
                 user_id,
-                f"⌛ **No fresh OTP found yet for** `{phone_number}`. Re-send OTP in your app and click again.",
+                f"⌛ **No fresh OTP found yet for** `{phone_number}`. Re-send OTP in app and click again.",
                 reply_markup=get_account_options_keyboard(acc_id)
             )
 
     except Exception as e:
         logging.error(f"OTP Fetch Error: {e}")
 
-async def listen_for_otp(user_id: int, phone_number: str, session_string: str, two_fa: str, acc_id: int):
+async def listen_for_otp(user_id: int, phone_number: str, session_string: str, two_fa: str, acc_id: str):
     try:
         t_client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
         await t_client.connect()
@@ -238,6 +216,7 @@ async def listen_for_otp(user_id: int, phone_number: str, session_string: str, t
 def get_main_menu_keyboard(user_id: int):
     buttons = [
         [InlineKeyboardButton("🛒 Buy Accounts", callback_data="user_buy_menu"), InlineKeyboardButton("💳 Deposit Money", callback_data="user_deposit_menu")],
+        [InlineKeyboardButton("💸 Withdraw Cashback", callback_data="user_withdraw_menu")],
         [InlineKeyboardButton("👤 Profile", callback_data="user_profile"), InlineKeyboardButton("👨‍💻 Support", url="https://t.me/your_admin_username")]
     ]
     if user_id in SUDO_USERS:
@@ -247,8 +226,8 @@ def get_main_menu_keyboard(user_id: int):
 def get_admin_panel_keyboard(user_id: int):
     buttons = [
         [InlineKeyboardButton("➕ Add Account Stock", callback_data="admin_add_acc"), InlineKeyboardButton("🏷️ Change Stock Price", callback_data="admin_change_price")],
-        [InlineKeyboardButton("✏️ Edit User Balance", callback_data="admin_edit_bal"), InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban_user")],
-        [InlineKeyboardButton("🟢 Unban User", callback_data="admin_unban_user")]
+        [InlineKeyboardButton("✏️ Edit User Balance", callback_data="admin_edit_bal"), InlineKeyboardButton("📢 Broadcast DM", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban_user"), InlineKeyboardButton("🟢 Unban User", callback_data="admin_unban_user")]
     ]
     if user_id == OWNER_ID:
         buttons.append([InlineKeyboardButton("👥 Manage Admins (Owner Only)", callback_data="admin_manage_sudo")])
@@ -260,26 +239,14 @@ def get_admin_panel_keyboard(user_id: int):
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     user_id = message.from_user.id
-    if await is_banned(user_id):
-        await message.reply_text("🚫 **You are banned from using this bot.**")
+    banned, reason = await is_banned(user_id)
+    if banned:
+        await message.reply_text(f"🚫 **You are banned from using this bot.**\n\n**Reason:** {reason}")
         return
         
     bal = await get_user_balance(user_id)
     text = f"👋 **Welcome to the Account Store Bot!**\n\n🆔 **User ID:** `{user_id}`\n💰 **Wallet Balance:** ₹{bal:.2f}"
     await message.reply_text(text, reply_markup=get_main_menu_keyboard(user_id))
-
-@app.on_message(filters.command("help") & filters.private)
-async def help_handler(client: Client, message: Message):
-    if await is_banned(message.from_user.id):
-        return
-    text = (
-        "❓ **Bot Help & Instructions**\n\n"
-        "1. **Buying Accounts:** Click **🛒 Buy Accounts**, select package & confirm.\n"
-        "2. **Depositing Funds:** Click **💳 Deposit Money**, enter amount (Min ₹50).\n"
-        "3. **Payment Verification:** Send payment screenshot & valid Transaction ID/UTR.\n"
-        "4. **Support:** Contact admins directly via **👨‍💻 Support** button."
-    )
-    await message.reply_text(text)
 
 @app.on_message(filters.command("admin") & filters.private)
 async def admin_command_handler(client: Client, message: Message):
@@ -287,16 +254,18 @@ async def admin_command_handler(client: Client, message: Message):
     if user_id not in SUDO_USERS:
         await message.reply_text("🚫 **Unauthorized.** This command is restricted to admins.")
         return
-    await message.reply_text("⚙️ **Welcome to the Admin Panel**", reply_markup=get_admin_panel_keyboard(user_id))
+    await message.reply_text("⚙️ **Welcome to the Admin Dashboard**", reply_markup=get_admin_panel_keyboard(user_id))
 
 # ==================== CALLBACK ROUTER ====================
 @app.on_callback_query()
 async def callback_router(client: Client, query: CallbackQuery):
+    from bson.objectid import ObjectId
     user_id = query.from_user.id
     data = query.data
 
-    if await is_banned(user_id):
-        await query.answer("🚫 You are banned!", show_alert=True)
+    banned, reason = await is_banned(user_id)
+    if banned:
+        await query.answer(f"🚫 You are banned! Reason: {reason}", show_alert=True)
         return
 
     if data == "user_main_menu":
@@ -305,195 +274,160 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_text(f"👋 **Main Menu**\n\n💰 **Balance:** ₹{bal:.2f}", reply_markup=get_main_menu_keyboard(user_id))
 
     elif data == "user_profile":
-        bal = await get_user_balance(user_id)
+        u_data = await get_user_data(user_id)
         await query.message.edit_text(
-            f"👤 **Your Profile**\n\n🆔 **ID:** `{user_id}`\n💵 **Wallet Balance:** ₹{bal:.2f}",
+            f"👤 **Your Profile**\n\n"
+            f"🆔 **ID:** `{user_id}`\n"
+            f"💵 **Wallet Balance:** ₹{u_data.get('balance', 0.0):.2f}\n"
+            f"🎁 **Purchasing Profile Cashback:** ₹{u_data.get('profile_cashback', 0.0):.2f}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="user_main_menu")]])
         )
 
     elif data == "user_buy_menu":
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute(
-                "SELECT country, year, price, has_discount, cashback, COUNT(*) FROM accounts WHERE status = 'AVAILABLE' GROUP BY country, year, price, has_discount, cashback"
-            ) as cursor:
-                stocks = await cursor.fetchall()
+        # Group accounts by category, country, year, price
+        pipeline = [
+            {"$match": {"status": "AVAILABLE"}},
+            {"$group": {
+                "_id": {
+                    "category": "$category",
+                    "country": "$country",
+                    "year": "$year",
+                    "price": "$price",
+                    "cashback": "$cashback"
+                },
+                "count": {"$sum": 1}
+            }}
+        ]
+        stocks = await accounts_col.aggregate(pipeline).to_list(length=100)
 
         if not stocks:
             await query.answer("❌ Currently Out of Stock!", show_alert=True)
             return
 
         buttons = []
-        for country, year, price, has_discount, cb, count in stocks:
-            btn_label = f"🌐 {country} ({year}) - ₹{price} | Stock: {count}"
-            if has_discount == "YES" and cb > 0:
-                btn_label += f" (🎁+₹{cb})"
-            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"buy_pkg_{country}_{year}_{price}")])
+        for s in stocks:
+            info = s["_id"]
+            cat = info.get("category", "General")
+            country = info["country"]
+            year = info["year"]
+            price = info["price"]
+            cb = info["cashback"]
+            count = s["count"]
+
+            btn_label = f"📁 [{cat}] {country} ({year}) - ₹{price} | Stock: {count}"
+            if cb > 0:
+                btn_label += f" (🎁 Cashback ₹{cb})"
+            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"buy_cat_{cat}_{country}_{year}_{price}")])
         
         buttons.append([InlineKeyboardButton("🔙 Back", callback_data="user_main_menu")])
-        await query.message.edit_text("🌍 **Select an Account Package:**", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.message.edit_text("🌍 **Select an Account Category:**", reply_markup=InlineKeyboardMarkup(buttons))
 
-    elif data.startswith("buy_pkg_"):
-        _, _, country, year, price = data.split("_")
-        price = float(price)
+    elif data.startswith("buy_cat_"):
+        parts = data.split("_")
+        category, country, year, price = parts[2], parts[3], parts[4], float(parts[5])
 
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("BEGIN IMMEDIATE")
-            async with db.execute(
-                "SELECT id, phone_number, session_string, two_fa, has_discount, cashback FROM accounts WHERE country = ? AND year = ? AND price = ? AND status = 'AVAILABLE' LIMIT 1",
-                (country, year, price)
-            ) as cursor:
-                acc = await cursor.fetchone()
+        acc = await accounts_col.find_one_and_update(
+            {"category": category, "country": country, "year": year, "price": price, "status": "AVAILABLE"},
+            {"$set": {"status": "SOLD", "sold_to": user_id}}
+        )
 
-            if not acc:
-                await db.rollback()
-                await query.answer("❌ Item is out of stock!", show_alert=True)
-                return
+        if not acc:
+            await query.answer("❌ Item is out of stock!", show_alert=True)
+            return
 
-            acc_id, phone, session_str, two_fa, has_discount, cashback = acc
-            bal = await get_user_balance(user_id)
+        acc_id = str(acc["_id"])
+        phone = acc["phone_number"]
+        session_str = acc["session_string"]
+        two_fa = acc["two_fa"]
+        cashback = acc.get("cashback", 0.0)
 
-            if bal < price:
-                await db.rollback()
-                await query.answer(f"❌ Insufficient Balance! Required: ₹{price}, Available: ₹{bal:.2f}", show_alert=True)
-                return
+        bal = await get_user_balance(user_id)
+        if bal < price:
+            # Revert stock if insufficient funds
+            await accounts_col.update_one({"_id": acc["_id"]}, {"$set": {"status": "AVAILABLE", "sold_to": None}})
+            await query.answer(f"❌ Insufficient Balance! Required: ₹{price}, Available: ₹{bal:.2f}", show_alert=True)
+            return
 
-            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, user_id))
-            await db.execute("UPDATE accounts SET status = 'SOLD', sold_to = ? WHERE id = ?", (user_id, acc_id))
-            
-            cashback_credited = 0.0
-            if has_discount == "YES" and cashback > 0:
-                await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (cashback, user_id))
-                cashback_credited = cashback
-
-            await db.commit()
+        await update_balance(user_id, -price)
 
         msg = f"✅ **Purchase Successful!**\n\n" \
+              f"📁 **Category:** {category}\n" \
               f"🌍 **Country:** {country} ({year})\n" \
               f"📞 **Phone Number:** `{phone}`\n" \
               f"🔑 **2FA Password:** `{two_fa}`\n" \
               f"💵 **Price Paid:** ₹{price}\n"
-        if cashback_credited > 0:
-            msg += f"🎁 **Cashback Added:** +₹{cashback_credited:.2f} credited to wallet!\n"
+
+        if cashback > 0:
+            temp_data[user_id] = {"pending_cashback": cashback, "acc_id": acc_id}
+            msg += f"\n🎁 **Cashback Earned:** ₹{cashback:.2f}! *(Finish & Logout ke baad choice milegi)*\n"
 
         await query.message.edit_text(msg, reply_markup=get_account_options_keyboard(acc_id))
 
         await log_to_channel(
             f"🛍️ **NEW PURCHASE LOG**\n\n"
             f"👤 **User ID:** `{user_id}`\n"
+            f"📁 **Category:** {category}\n"
             f"🌍 **Account:** {country} ({year})\n"
             f"💵 **Price:** ₹{price}\n"
-            f"🎁 **Cashback Given:** ₹{cashback_credited}"
+            f"🎁 **Cashback:** ₹{cashback}"
         )
 
         asyncio.create_task(listen_for_otp(user_id, phone, session_str, two_fa, acc_id))
 
-    elif data.startswith("refetch_otp_"):
-        acc_id = int(data.split("_")[2])
-        await query.answer("🔄 Re-fetching latest OTP...", show_alert=False)
-        await fetch_latest_otp(user_id, acc_id, is_manual=True)
-
-    elif data.startswith("manage_devs_"):
-        acc_id = int(data.split("_")[2])
-        await query.answer("📱 Fetching active devices...", show_alert=False)
-
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT session_string, phone_number FROM accounts WHERE id = ?", (acc_id,)) as cursor:
-                row = await cursor.fetchone()
-
-        if row:
-            session_str, phone = row
-            try:
-                t_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-                await t_client.connect()
-                authorizations = await t_client(GetAuthorizationsRequest())
-                await t_client.disconnect()
-
-                buttons = []
-                for auth in authorizations.authorizations:
-                    # Non-current sessions get individual termination buttons
-                    if not auth.current:
-                        device_label = f"❌ Remove: {auth.device_model} ({auth.app_name})"
-                        buttons.append([InlineKeyboardButton(device_label, callback_data=f"del_dev_{acc_id}_{auth.hash}")])
-                    else:
-                        buttons.append([InlineKeyboardButton(f"🟢 Current: {auth.device_model} (Bot)", callback_data="none")])
-
-                buttons.append([InlineKeyboardButton("🔙 Back to Options", callback_data=f"back_acc_opt_{acc_id}")])
-
-                await query.message.reply_text(
-                    f"📱 **Active Devices for** `{phone}`:\n\nClick any device to terminate session:",
-                    reply_markup=InlineKeyboardMarkup(buttons)
-                )
-
-            except Exception as e:
-                await query.message.reply_text(f"⚠️ Failed to list devices: `{e}`")
-
-    elif data.startswith("del_dev_"):
-        _, _, acc_id, auth_hash = data.split("_")
-        acc_id = int(acc_id)
-        auth_hash = int(auth_hash)
-
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT session_string FROM accounts WHERE id = ?", (acc_id,)) as cursor:
-                row = await cursor.fetchone()
-
-        if row:
-            try:
-                t_client = TelegramClient(StringSession(row[0]), API_ID, API_HASH)
-                await t_client.connect()
-                await t_client(ResetAuthorizationRequest(hash=auth_hash))
-                await t_client.disconnect()
-                await query.answer("✅ Device removed successfully!", show_alert=True)
-            except Exception as e:
-                await query.answer(f"❌ Device remove failed: {e}", show_alert=True)
-
-    elif data.startswith("term_sess_"):
-        acc_id = int(data.split("_")[2])
-        await query.answer("⏳ Terminating all other sessions...", show_alert=True)
-
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT session_string FROM accounts WHERE id = ?", (acc_id,)) as cursor:
-                row = await cursor.fetchone()
-
-        if row:
-            session_str = row[0]
-            try:
-                t_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-                await t_client.connect()
-                await t_client.reset_authorization(0)
-                await t_client.disconnect()
-                await query.message.reply_text("✅ **All other active devices terminated! Only your current device session remains.**")
-            except Exception as e:
-                await query.message.reply_text(f"⚠️ **Notice:** Failed to terminate sessions. Reason: `{e}`")
-
     elif data.startswith("logout_bot_"):
-        acc_id = int(data.split("_")[2])
+        acc_id = data.split("_")[2]
         await query.answer("🚪 Logging out bot session...", show_alert=True)
 
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute("SELECT session_string FROM accounts WHERE id = ?", (acc_id,)) as cursor:
-                row = await cursor.fetchone()
-
-        if row:
+        acc = await accounts_col.find_one({"_id": ObjectId(acc_id)})
+        if acc:
             try:
-                t_client = TelegramClient(StringSession(row[0]), API_ID, API_HASH)
+                t_client = TelegramClient(StringSession(acc["session_string"]), API_ID, API_HASH)
                 await t_client.connect()
                 await t_client.log_out()
-                await query.message.reply_text("🚪 **Finish & Logout Complete! Bot session successfully deleted.**")
+                await query.message.reply_text("🚪 **Finish & Logout Complete! Bot session deleted.**")
             except Exception as e:
-                await query.message.reply_text(f"⚠️ Session already closed or error: `{e}`")
+                await query.message.reply_text(f"⚠️ Session notice: `{e}`")
 
-    elif data.startswith("back_acc_opt_"):
-        acc_id = int(data.split("_")[3])
-        await query.message.edit_text("🛠️ **Account Options Panel:**", reply_markup=get_account_options_keyboard(acc_id))
+        # CASHBACK PROMPT AFTER LOGOUT
+        cb_info = temp_data.get(user_id)
+        if cb_info and cb_info.get("pending_cashback", 0) > 0:
+            cb_val = cb_info["pending_cashback"]
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Add to Main Wallet", callback_data=f"cb_claim_wallet_{cb_val}")],
+                [InlineKeyboardButton("👤 Add to Purchasing Profile", callback_data=f"cb_claim_profile_{cb_val}")]
+            ])
+            await app.send_message(
+                user_id,
+                f"🎉 **You have purchased the cashback account!**\n\n"
+                f"🎁 **Cashback Amount:** ₹{cb_val:.2f}\n"
+                f"Where would you like to add your cashback rewards? *(Note: Wallet balance baad m bhi QR par ₹50 hone par withdraw kar sakte ho)*",
+                reply_markup=kb
+            )
 
-    elif data == "user_deposit_menu":
-        user_states[user_id] = "WAIT_DEPOSIT_AMOUNT_INPUT"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="user_main_menu")]])
+    elif data.startswith("cb_claim_wallet_"):
+        amount = float(data.split("_")[3])
+        await update_balance(user_id, amount)
+        temp_data.pop(user_id, None)
+        await query.message.edit_text(f"✅ **₹{amount:.2f} Cashback credited to your Main Wallet!**")
+
+    elif data.startswith("cb_claim_profile_"):
+        amount = float(data.split("_")[3])
+        await update_profile_cashback(user_id, amount)
+        temp_data.pop(user_id, None)
+        await query.message.edit_text(f"✅ **₹{amount:.2f} Cashback saved to your Purchasing Profile!**")
+
+    elif data == "user_withdraw_menu":
+        bal = await get_user_balance(user_id)
+        if bal < MIN_WITHDRAW:
+            await query.answer(f"❌ Minimum ₹{MIN_WITHDRAW:.2f} required to withdraw. Your balance: ₹{bal:.2f}", show_alert=True)
+            return
+
+        user_states[user_id] = "WAIT_WITHDRAW_AMOUNT"
         await query.message.edit_text(
-            f"💳 **ADD MONEY TO WALLET**\n\n"
-            f"⚠️ **Minimum Deposit:** ₹{MIN_DEPOSIT:.2f}\n\n"
-            f"🔢 **Enter the amount (₹) you want to deposit:**",
-            reply_markup=kb
+            f"💸 **CASHBACK / WALLET WITHDRAWAL**\n\n"
+            f"💰 **Available Balance:** ₹{bal:.2f}\n"
+            f"⚠️ **Minimum Withdrawal:** ₹{MIN_WITHDRAW:.2f}\n\n"
+            f"🔢 **Enter amount to withdraw:**"
         )
 
     # ADMIN HANDLERS
@@ -503,131 +437,126 @@ async def callback_router(client: Client, query: CallbackQuery):
 
     elif data == "admin_add_acc":
         if user_id not in SUDO_USERS: return
-        user_states[user_id] = "ADM_STEP_COUNTRY"
-        await query.message.edit_text("📝 **Step 1:** Enter the Country Name (e.g., `India`, `USA`):")
-
-    elif data == "admin_change_price":
-        if user_id not in SUDO_USERS: return
-        async with aiosqlite.connect(DB_NAME) as db:
-            async with db.execute(
-                "SELECT country, year, price, COUNT(*) FROM accounts WHERE status = 'AVAILABLE' GROUP BY country, year, price"
-            ) as cursor:
-                stocks = await cursor.fetchall()
-
-        if not stocks:
-            await query.answer("❌ No active stock found to edit prices!", show_alert=True)
-            return
-
-        buttons = []
-        for country, year, current_price, count in stocks:
-            btn_label = f"🌐 {country} ({year}) | Current: ₹{current_price} | Qty: {count}"
-            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"adm_chgprice_{country}_{year}_{current_price}")])
-        
-        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
-        await query.message.edit_text("🏷️ **Select Stock Category to Change Price:**", reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data.startswith("adm_chgprice_"):
-        if user_id not in SUDO_USERS: return
-        _, _, country, year, old_price = data.split("_")
-        temp_data[user_id] = {"country": country, "year": year, "old_price": float(old_price)}
-        user_states[user_id] = "ADM_STEP_NEW_STOCK_PRICE"
-        await query.message.edit_text(f"💵 **Category:** {country} ({year})\n**Current Price:** ₹{old_price}\n\nEnter the **New Price (₹)** for this category:")
-
-    elif data == "admin_edit_bal":
-        if user_id not in SUDO_USERS: return
-        user_states[user_id] = "ADM_STEP_BAL_USER"
-        await query.message.edit_text("👤 **Enter Target User ID or @Username:**")
-
-    elif data == "admin_manage_sudo":
-        if user_id != OWNER_ID:
-            await query.answer("🚫 Only Owner can access Sudo settings!", show_alert=True)
-            return
-        
-        admin_list_text = "\n".join([f"• `{sudo}`" + (" 👑 (Owner)" if sudo == OWNER_ID else "") for sudo in SUDO_USERS])
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add New Admin", callback_data="admin_add_sudo_step"), InlineKeyboardButton("➖ Remove Admin", callback_data="admin_rem_sudo_step")],
-            [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
+            [InlineKeyboardButton("⚡ Temporary Spam", callback_data="adm_cat_Temporary Spam")],
+            [InlineKeyboardButton("🚫 Permanent Spam", callback_data="adm_cat_Permanent Spam")],
+            [InlineKeyboardButton("✨ Fresh Account", callback_data="adm_cat_Fresh Account")],
+            [InlineKeyboardButton("📜 Old Account", callback_data="adm_cat_Old Account")]
         ])
-        await query.message.edit_text(
-            f"👥 **Current Sudo Admin List:**\n\n{admin_list_text}\n\nSelect an option below to manage admins.",
-            reply_markup=kb
-        )
+        await query.message.edit_text("📂 **Select Account Category:**", reply_markup=kb)
 
-    elif data == "admin_add_sudo_step":
-        if user_id != OWNER_ID: return
-        user_states[user_id] = "ADM_STEP_ADD_SUDO"
-        await query.message.edit_text("👤 **Enter User ID or @username to make Admin:**")
+    elif data.startswith("adm_cat_"):
+        if user_id not in SUDO_USERS: return
+        cat = data.split("_")[2]
+        temp_data[user_id] = {"category": cat}
+        user_states[user_id] = "ADM_STEP_COUNTRY"
+        await query.message.edit_text(f" Selected Category: **{cat}**\n\n📝 **Step 1:** Enter Country Name (e.g. `India`, `USA`):")
 
-    elif data == "admin_rem_sudo_step":
-        if user_id != OWNER_ID: return
-        user_states[user_id] = "ADM_STEP_REM_SUDO"
-        await query.message.edit_text("👤 **Enter User ID or @username to remove Admin privileges:**")
+    elif data == "admin_broadcast":
+        if user_id not in SUDO_USERS: return
+        user_states[user_id] = "ADM_STEP_BROADCAST"
+        await query.message.edit_text("📢 **Send the message you want to Broadcast in DM to all users:**")
 
     elif data == "admin_ban_user":
         if user_id not in SUDO_USERS: return
-        user_states[user_id] = "ADM_STEP_BAN_USER"
+        user_states[user_id] = "ADM_STEP_BAN_ID"
         await query.message.edit_text("🚫 **Enter User ID or @Username to Ban:**")
 
     elif data == "admin_unban_user":
         if user_id not in SUDO_USERS: return
-        user_states[user_id] = "ADM_STEP_UNBAN_USER"
+        user_states[user_id] = "ADM_STEP_UNBAN_ID"
         await query.message.edit_text("🟢 **Enter User ID or @Username to Unban:**")
 
-    elif data in ["adm_disc_YES", "adm_disc_NO"]:
-        if user_id not in SUDO_USERS: return
-        choice = data.split("_")[2]
-        temp_data[user_id]["has_discount"] = choice
-        
-        if choice == "YES":
-            user_states[user_id] = "ADM_STEP_CASHBACK_VAL"
-            await query.message.edit_text("🎁 **Enter Cashback Amount (e.g., 20):**")
-        else:
-            temp_data[user_id]["cashback"] = 0.0
-            user_states[user_id] = "ADM_STEP_PHONE"
-            await query.message.edit_text("📞 **Enter Account Phone Number (with Country Code e.g. `+1234567890`):**")
-
-    # PRIVATE ADMIN DM APPROVAL / REJECTION HANDLERS
+    # WITHDRAWAL AND DEPOSIT SINGLE APPROVAL ENGINE
     elif data.startswith("adm_app_dep_"):
-        if user_id not in SUDO_USERS:
-            await query.answer("🚫 Only Sudo Admins can approve deposits!", show_alert=True)
-            return
+        if user_id not in SUDO_USERS: return
+        _, _, _, dep_user_id, amount, req_id = data.split("_")
+        dep_user_id = int(dep_user_id)
+        amount = float(amount)
 
-        parts = data.split("_")
-        dep_user_id = int(parts[3])
-        amount = float(parts[4])
+        # Concurrency Lock
+        res = await requests_col.find_one_and_update({"_id": req_id, "status": "PENDING"}, {"$set": {"status": "APPROVED"}})
+        if not res:
+            await query.answer("⚠️ Already processed by another admin!", show_alert=True)
+            return
 
         await update_balance(dep_user_id, amount)
         admin_mention = query.from_user.mention
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **APPROVED (+₹{amount:.2f})** by {admin_mention}")
         await app.send_message(dep_user_id, f"🎉 **Deposit Approved!** ₹{amount:.2f} credited to your wallet.")
-        
-        await log_to_channel(f"✅ **DEPOSIT APPROVED**\n👤 User: `{dep_user_id}`\n💵 Amount: ₹{amount:.2f}\n👨‍💻 Approved By: {admin_mention}")
 
     elif data.startswith("adm_rej_dep_"):
-        if user_id not in SUDO_USERS:
-            await query.answer("🚫 Only Sudo Admins can reject deposits!", show_alert=True)
+        if user_id not in SUDO_USERS: return
+        _, _, _, dep_user_id, req_id = data.split("_")
+        dep_user_id = int(dep_user_id)
+
+        res = await requests_col.find_one_and_update({"_id": req_id, "status": "PENDING"}, {"$set": {"status": "REJECTED"}})
+        if not res:
+            await query.answer("⚠️ Already processed by another admin!", show_alert=True)
             return
 
-        dep_user_id = int(data.split("_")[3])
         admin_mention = query.from_user.mention
         await query.message.edit_caption(caption=query.message.caption + f"\n\n❌ **REJECTED** by {admin_mention}")
         await app.send_message(dep_user_id, "❌ Your deposit request was rejected by Admin.")
-        
-        await log_to_channel(f"❌ **DEPOSIT REJECTED**\n👤 User: `{dep_user_id}`\n👨‍💻 Rejected By: {admin_mention}")
+
+    elif data.startswith("own_app_wth_"):
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Only Owner can process withdrawals!", show_alert=True)
+            return
+        _, _, _, w_user_id, amount, req_id = data.split("_")
+        w_user_id = int(w_user_id)
+        amount = float(amount)
+
+        res = await requests_col.find_one_and_update({"_id": req_id, "status": "PENDING"}, {"$set": {"status": "APPROVED"}})
+        if not res:
+            await query.answer("⚠️ Request already actioned!", show_alert=True)
+            return
+
+        await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **WITHDRAW SUCCESSFUL! Money Sent.**")
+        await app.send_message(w_user_id, f"🎉 **Withdrawal Successful!** ₹{amount:.2f} has been transferred to your QR code.")
 
 # ==================== PHOTO RECEIVER ====================
 @app.on_message(filters.photo & filters.private)
 async def photo_receiver(client: Client, message: Message):
     user_id = message.from_user.id
-    if user_states.get(user_id) == "WAIT_DEPOSIT_PHOTO":
+    state = user_states.get(user_id)
+
+    if state == "WAIT_DEPOSIT_PHOTO":
         temp_data[user_id]["photo_id"] = message.photo.file_id
         user_states[user_id] = "WAIT_DEPOSIT_TXN_ID"
-        await message.reply_text(
-            "🧾 **Now enter the Transaction ID / UTR Number:**\n\n"
-            "Examples:\n"
-            "• PhonePe / GPay / Paytm: `3245XXXXXXXX` (12 digits)\n"
-            "• FamPay: `FPXXXXXXXXXX` or 12-digit Ref No."
+        await message.reply_text("🧾 **Now enter the Transaction ID / UTR Number:**")
+
+    elif state == "WAIT_WITHDRAW_QR":
+        qr_photo_id = message.photo.file_id
+        amount = temp_data[user_id]["withdraw_amount"]
+        user_states.pop(user_id, None)
+
+        # Deduct Balance
+        await update_balance(user_id, -amount)
+
+        # Create lock record
+        req_doc = {"type": "WITHDRAW", "status": "PENDING"}
+        req_res = await requests_col.insert_one(req_doc)
+        req_id = str(req_res.inserted_id)
+
+        await message.reply_text("⏳ **Withdrawal request submitted! Sent to Owner for payment processing.**")
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Send Money & Approve", callback_data=f"own_app_wth_{user_id}_{amount}_{req_id}")]
+        ])
+
+        caption = (
+            f"💸 **NEW WITHDRAWAL REQUEST (OWNER ONLY)**\n\n"
+            f"👤 **User:** {message.from_user.mention} (`{user_id}`)\n"
+            f"💵 **Amount:** ₹{amount:.2f}\n"
+            f"📌 **Status:** Pending payment to QR below."
         )
+
+        # Send STRICTLY to OWNER_ID
+        try:
+            await app.send_photo(chat_id=OWNER_ID, photo=qr_photo_id, caption=caption, reply_markup=kb)
+        except Exception as e:
+            logging.error(f"Failed to send withdraw req to Owner: {e}")
 
 # ==================== STEP-BY-STEP INPUT ROUTER ====================
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "help", "admin"]))
@@ -638,37 +567,44 @@ async def text_router(client: Client, message: Message):
     if not state:
         return
 
-    if state == "WAIT_DEPOSIT_AMOUNT_INPUT":
+    if state == "WAIT_WITHDRAW_AMOUNT":
+        try:
+            amount = float(message.text.strip())
+            bal = await get_user_balance(user_id)
+
+            if amount < MIN_WITHDRAW:
+                await message.reply_text(f"❌ Minimum withdrawal is ₹{MIN_WITHDRAW:.2f}:")
+                return
+
+            if amount > bal:
+                await message.reply_text(f"❌ Insufficient wallet balance! Available: ₹{bal:.2f}:")
+                return
+
+            temp_data[user_id] = {"withdraw_amount": amount}
+            user_states[user_id] = "WAIT_WITHDRAW_QR"
+            await message.reply_text("📸 **Now send your Payment QR Code Photo:**")
+
+        except ValueError:
+            await message.reply_text("❌ Enter numbers only:")
+
+    elif state == "WAIT_DEPOSIT_AMOUNT_INPUT":
         try:
             amount = float(message.text.strip())
             if amount < MIN_DEPOSIT:
-                await message.reply_text(f"❌ **Minimum Deposit limit is ₹{MIN_DEPOSIT:.2f}.** Please enter an amount equal to or greater than ₹{MIN_DEPOSIT:.2f}:")
+                await message.reply_text(f"❌ **Minimum Deposit limit is ₹{MIN_DEPOSIT:.2f}.**")
                 return
 
             temp_data[user_id] = {"amount": amount}
             user_states[user_id] = "WAIT_DEPOSIT_PHOTO"
             
             qr_image = generate_upi_qr(UPI_ID_TEXT, PAYEE_NAME, amount)
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Deposit", callback_data="user_main_menu")]])
-            
-            deposit_text = (
-                f"💳 **ADD MONEY TO WALLET**\n\n"
-                f"💵 **Requested Amount:** ₹{amount:.2f}\n"
-                f"🔹 **UPI ID:** `{UPI_ID_TEXT}` (Tap to Copy)\n"
-                f"🔹 **Payee Name:** {PAYEE_NAME}\n\n"
-                f"📌 **Instructions:**\n"
-                f"1️⃣ Scan QR Code or send exactly ₹{amount:.2f} to UPI ID.\n"
-                f"2️⃣ Send the **Payment Screenshot** right here in this chat."
-            )
-
             await app.send_photo(
                 chat_id=user_id,
                 photo=qr_image,
-                caption=deposit_text,
-                reply_markup=kb
+                caption=f"💳 **Send ₹{amount:.2f} to UPI ID:** `{UPI_ID_TEXT}`\n\nSend payment screenshot here."
             )
         except ValueError:
-            await message.reply_text("❌ Invalid input! Please enter numbers only (e.g., 50 or 100):")
+            await message.reply_text("❌ Invalid input!")
 
     elif state == "WAIT_DEPOSIT_TXN_ID":
         txn_id = message.text.strip()
@@ -677,12 +613,16 @@ async def text_router(client: Client, message: Message):
         amount = data["amount"]
         user_states.pop(user_id, None)
 
+        req_doc = {"type": "DEPOSIT", "status": "PENDING"}
+        req_res = await requests_col.insert_one(req_doc)
+        req_id = str(req_res.inserted_id)
+
         await message.reply_text("⏳ **Deposit proof submitted! Admins are verifying your payment.**")
         
         kb = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("✅ Approve", callback_data=f"adm_app_dep_{user_id}_{amount}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"adm_rej_dep_{user_id}")
+                InlineKeyboardButton("✅ Approve", callback_data=f"adm_app_dep_{user_id}_{amount}_{req_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"adm_rej_dep_{user_id}_{req_id}")
             ]
         ])
 
@@ -695,39 +635,70 @@ async def text_router(client: Client, message: Message):
 
         for sudo_id in SUDO_USERS:
             try:
-                await app.send_photo(
-                    chat_id=sudo_id,
-                    photo=photo_id,
-                    caption=deposit_caption,
-                    reply_markup=kb
-                )
+                await app.send_photo(chat_id=sudo_id, photo=photo_id, caption=deposit_caption, reply_markup=kb)
             except Exception as e:
-                logging.error(f"Failed to send DM to Admin {sudo_id}: {e}")
+                logging.error(f"Failed sending DM to Admin {sudo_id}: {e}")
 
-    elif state == "ADM_STEP_NEW_STOCK_PRICE":
+    # BROADCAST HANDLER
+    elif state == "ADM_STEP_BROADCAST":
+        user_states.pop(user_id, None)
+        broadcast_msg = message.text
+        cursor = users_col.find({"is_banned": False})
+        users = await cursor.to_list(length=10000)
+
+        success = 0
+        failed = 0
+        await message.reply_text(f"⏳ **Starting broadcast to {len(users)} users...**")
+
+        for u in users:
+            try:
+                await app.send_message(u["user_id"], broadcast_msg)
+                success += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                failed += 1
+
+        await message.reply_text(f"✅ **Broadcast Completed!**\n\n🟢 Delivered: {success}\n🔴 Failed: {failed}")
+
+    # BAN / UNBAN REASON FLOW HANDLERS
+    elif state == "ADM_STEP_BAN_ID":
         try:
-            new_price = float(message.text.strip())
-            category_info = temp_data[user_id]
-            
-            async with aiosqlite.connect(DB_NAME) as db:
-                await db.execute(
-                    "UPDATE accounts SET price = ? WHERE country = ? AND year = ? AND price = ? AND status = 'AVAILABLE'",
-                    (new_price, category_info["country"], category_info["year"], category_info["old_price"])
-                )
-                await db.commit()
-            
-            user_states.pop(user_id, None)
-            await message.reply_text(
-                f"✅ **Stock Price Updated Successfully!**\n\n"
-                f"🌍 **Category:** {category_info['country']} ({category_info['year']})\n"
-                f"💵 **New Price:** ₹{new_price:.2f}",
-                reply_markup=get_admin_panel_keyboard(user_id)
-            )
-        except ValueError:
-            await message.reply_text("❌ Please enter numbers only:")
+            target_user = (await client.get_users(message.text.strip())).id
+            temp_data[user_id] = {"target_ban_user": target_user}
+            user_states[user_id] = "ADM_STEP_BAN_REASON"
+            await message.reply_text(f"👤 Target User ID: `{target_user}`\n\n📝 **Enter Reason for Ban:**")
+        except Exception:
+            await message.reply_text("❌ Invalid User ID or Username:")
 
+    elif state == "ADM_STEP_BAN_REASON":
+        reason = message.text.strip()
+        target_user = temp_data[user_id]["target_ban_user"]
+        user_states.pop(user_id, None)
+
+        await users_col.update_one({"user_id": target_user}, {"$set": {"is_banned": True, "ban_reason": reason}}, upsert=True)
+        await message.reply_text(f"🚫 User `{target_user}` banned.\n**Reason:** {reason}")
+        
+        try:
+            await app.send_message(target_user, f"🚫 **You have been banned from the bot.**\n\n**Reason:** {reason}")
+        except Exception:
+            pass
+
+    elif state == "ADM_STEP_UNBAN_ID":
+        try:
+            target_user = (await client.get_users(message.text.strip())).id
+            user_states.pop(user_id, None)
+            await users_col.update_one({"user_id": target_user}, {"$set": {"is_banned": False, "ban_reason": ""}})
+            await message.reply_text(f"🟢 User `{target_user}` is now Unbanned.")
+            try:
+                await app.send_message(target_user, "🎉 **Your account has been unbanned by Admin!** You can use the bot again.")
+            except Exception:
+                pass
+        except Exception:
+            await message.reply_text("❌ Invalid User ID or Username:")
+
+    # ACCOUNT ADDITION FLOW
     elif state == "ADM_STEP_COUNTRY":
-        temp_data[user_id] = {"country": message.text.strip()}
+        temp_data[user_id]["country"] = message.text.strip()
         user_states[user_id] = "ADM_STEP_YEAR"
         await message.reply_text("📅 **Step 2:** Enter Account Creation Year (e.g. `2022`, `2024`):")
 
@@ -739,13 +710,8 @@ async def text_router(client: Client, message: Message):
     elif state == "ADM_STEP_PRICE":
         try:
             temp_data[user_id]["price"] = float(message.text.strip())
-            user_states[user_id] = "ADM_STEP_DISCOUNT_OPTION"
-            
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ YES (Enable Discount)", callback_data="adm_disc_YES")],
-                [InlineKeyboardButton("❌ NO (No Discount)", callback_data="adm_disc_NO")]
-            ])
-            await message.reply_text("🎁 **Do you want to enable Cashback/Discount on this account?**", reply_markup=kb)
+            user_states[user_id] = "ADM_STEP_CASHBACK_VAL"
+            await message.reply_text("🎁 **Enter Cashback Amount (If none, type `0`):**")
         except ValueError:
             await message.reply_text("❌ Please enter numbers only:")
 
@@ -753,7 +719,7 @@ async def text_router(client: Client, message: Message):
         try:
             temp_data[user_id]["cashback"] = float(message.text.strip())
             user_states[user_id] = "ADM_STEP_PHONE"
-            await message.reply_text("📞 **Enter Account Phone Number (with country code e.g. `+1234567890`):**")
+            await message.reply_text("📞 **Enter Account Phone Number (with Country Code e.g. `+1234567890`):**")
         except ValueError:
             await message.reply_text("❌ Please enter numbers only:")
 
@@ -766,8 +732,7 @@ async def text_router(client: Client, message: Message):
         temp_data[user_id]["two_fa"] = message.text.strip()
         phone = temp_data[user_id]["phone"]
 
-        await message.reply_text(f"⏳ Triggering Telegram OTP request to `{phone}`... Check your Telegram App.")
-
+        await message.reply_text(f"⏳ Triggering Telegram OTP request to `{phone}`...")
         t_client = TelegramClient(StringSession(), API_ID, API_HASH)
         await t_client.connect()
         await t_client.send_code_request(phone)
@@ -795,95 +760,35 @@ async def text_router(client: Client, message: Message):
             session_str = t_client.session.save()
             await t_client.disconnect()
 
-            async with aiosqlite.connect(DB_NAME) as db:
-                await db.execute("""
-                    INSERT OR REPLACE INTO accounts 
-                    (country, year, price, has_discount, cashback, phone_number, session_string, two_fa, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'AVAILABLE')
-                """, (data["country"], data["year"], data["price"], data["has_discount"], data["cashback"], data["phone"], session_str, data["two_fa"]))
-                await db.commit()
+            acc_doc = {
+                "category": data["category"],
+                "country": data["country"],
+                "year": data["year"],
+                "price": data["price"],
+                "cashback": data["cashback"],
+                "phone_number": data["phone"],
+                "session_string": session_str,
+                "two_fa": data["two_fa"],
+                "status": "AVAILABLE",
+                "sold_to": None
+            }
+            await accounts_col.insert_one(acc_doc)
 
             user_states.pop(user_id, None)
-            await message.reply_text(f"✅ **Account Added / Updated in Stock!**\n\n🌍 {data['country']} ({data['year']})\n📞 `{data['phone']}`", reply_markup=get_admin_panel_keyboard(user_id))
+            await message.reply_text(
+                f"✅ **Account Added to MongoDB Stock!**\n\n"
+                f"📂 **Category:** {data['category']}\n"
+                f"🌍 **Location:** {data['country']} ({data['year']})\n"
+                f"📞 **Phone:** `{data['phone']}`",
+                reply_markup=get_admin_panel_keyboard(user_id)
+            )
 
         except Exception as e:
             await message.reply_text(f"❌ Error during sign in: `{e}`")
-
-    elif state == "ADM_STEP_BAL_USER":
-        input_text = message.text.strip()
-        try:
-            target_user = (await client.get_users(input_text)).id
-            temp_data[user_id] = {"target_user": target_user}
-            user_states[user_id] = "ADM_STEP_BAL_NEW_VAL"
-            await message.reply_text(f"💵 Target User ID: `{target_user}`\nEnter the new **Exact Balance (₹)**:")
-        except Exception:
-            await message.reply_text("❌ Could not find user. Send valid User ID or Username:")
-
-    elif state == "ADM_STEP_BAL_NEW_VAL":
-        try:
-            new_bal = float(message.text.strip())
-            target_user = temp_data[user_id]["target_user"]
-            await set_user_balance(target_user, new_bal)
-            user_states.pop(user_id, None)
-            await message.reply_text(f"✅ User `{target_user}` balance updated to **₹{new_bal:.2f}**.", reply_markup=get_admin_panel_keyboard(user_id))
-            await app.send_message(target_user, f"🔔 **Your Wallet Balance has been updated to: ₹{new_bal:.2f}**")
-        except ValueError:
-            await message.reply_text("❌ Please enter numbers only:")
-
-    elif state == "ADM_STEP_ADD_SUDO":
-        input_text = message.text.strip()
-        try:
-            new_sudo = await client.get_users(input_text)
-            new_sudo_id = new_sudo.id
-            await add_sudo_user(new_sudo_id)
-            user_states.pop(user_id, None)
-            await message.reply_text(f"✅ User `{new_sudo_id}` (@{new_sudo.username or 'No Username'}) has been granted Admin privileges.", reply_markup=get_admin_panel_keyboard(user_id))
-            await app.send_message(new_sudo_id, "🎉 **You have been granted Admin privileges!** Use /admin to open the panel.")
-        except Exception as e:
-            await message.reply_text(f"❌ Failed to resolve user `{input_text}`. Please check the ID/username: {e}")
-
-    elif state == "ADM_STEP_REM_SUDO":
-        input_text = message.text.strip()
-        try:
-            target_sudo = await client.get_users(input_text)
-            target_sudo_id = target_sudo.id
-            if target_sudo_id == OWNER_ID:
-                await message.reply_text("❌ You cannot remove the Owner!")
-                return
-            await remove_sudo_user(target_sudo_id)
-            user_states.pop(user_id, None)
-            await message.reply_text(f"✅ User `{target_sudo_id}` admin privileges revoked.", reply_markup=get_admin_panel_keyboard(user_id))
-            await app.send_message(target_sudo_id, "⚠️ **Your Admin privileges have been revoked.**")
-        except Exception as e:
-            await message.reply_text(f"❌ Failed to resolve user: {e}")
-
-    elif state == "ADM_STEP_BAN_USER":
-        input_text = message.text.strip()
-        try:
-            target_user = (await client.get_users(input_text)).id
-            async with aiosqlite.connect(DB_NAME) as db:
-                await db.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (target_user,))
-                await db.commit()
-            user_states.pop(user_id, None)
-            await message.reply_text(f"🚫 User `{target_user}` is now Banned.", reply_markup=get_admin_panel_keyboard(user_id))
-        except Exception:
-            await message.reply_text("❌ Invalid User ID or Username:")
-
-    elif state == "ADM_STEP_UNBAN_USER":
-        input_text = message.text.strip()
-        try:
-            target_user = (await client.get_users(input_text)).id
-            async with aiosqlite.connect(DB_NAME) as db:
-                await db.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (target_user,))
-                await db.commit()
-            user_states.pop(user_id, None)
-            await message.reply_text(f"🟢 User `{target_user}` is now Unbanned.", reply_markup=get_admin_panel_keyboard(user_id))
-        except Exception:
-            await message.reply_text("❌ Invalid User ID or Username:")
 
 # ==================== START SERVER ====================
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
-    print("🚀 All-in-One Button Shop Bot Activated!")
+    print("🚀 Mongo Engine Activated!")
     app.run()
