@@ -11,7 +11,6 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQ
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
-from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # ==================== ENVIRONMENT CONFIGURATION ====================
@@ -39,7 +38,7 @@ db = mongo_client["shop_bot_db"]
 users_col = db["users"]
 accounts_col = db["accounts"]
 sudo_col = db["sudo_users"]
-requests_col = db["requests"]  # Active transaction locks
+requests_col = db["requests"]
 
 SUDO_USERS = set()
 
@@ -127,7 +126,8 @@ def get_account_options_keyboard(acc_id: str):
         [InlineKeyboardButton("🔄 Re-fetch OTP", callback_data=f"refetch_otp_{acc_id}")],
         [InlineKeyboardButton("📱 Manage Devices", callback_data=f"manage_devs_{acc_id}")],
         [InlineKeyboardButton("🛠️ Terminate Other Sessions", callback_data=f"term_sess_{acc_id}")],
-        [InlineKeyboardButton("🚪 Finish & Logout Bot", callback_data=f"logout_bot_{acc_id}")]
+        [InlineKeyboardButton("🚪 Finish & Logout Bot", callback_data=f"logout_bot_{acc_id}")],
+        [InlineKeyboardButton("🔙 Main Menu", callback_data="user_main_menu")]
     ])
 
 # ==================== OTP LISTENER ENGINE ====================
@@ -239,6 +239,7 @@ def get_admin_panel_keyboard(user_id: int):
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     user_id = message.from_user.id
+    user_states.pop(user_id, None)
     banned, reason = await is_banned(user_id)
     if banned:
         await message.reply_text(f"🚫 **You are banned from using this bot.**\n\n**Reason:** {reason}")
@@ -251,6 +252,7 @@ async def start_handler(client: Client, message: Message):
 @app.on_message(filters.command("admin") & filters.private)
 async def admin_command_handler(client: Client, message: Message):
     user_id = message.from_user.id
+    user_states.pop(user_id, None)
     if user_id not in SUDO_USERS:
         await message.reply_text("🚫 **Unauthorized.** This command is restricted to admins.")
         return
@@ -270,6 +272,7 @@ async def callback_router(client: Client, query: CallbackQuery):
 
     if data == "user_main_menu":
         user_states.pop(user_id, None)
+        temp_data.pop(user_id, None)
         bal = await get_user_balance(user_id)
         await query.message.edit_text(f"👋 **Main Menu**\n\n💰 **Balance:** ₹{bal:.2f}", reply_markup=get_main_menu_keyboard(user_id))
 
@@ -280,11 +283,19 @@ async def callback_router(client: Client, query: CallbackQuery):
             f"🆔 **ID:** `{user_id}`\n"
             f"💵 **Wallet Balance:** ₹{u_data.get('balance', 0.0):.2f}\n"
             f"🎁 **Purchasing Profile Cashback:** ₹{u_data.get('profile_cashback', 0.0):.2f}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="user_main_menu")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
+        )
+
+    elif data == "user_deposit_menu":
+        user_states[user_id] = "WAIT_DEPOSIT_AMOUNT_INPUT"
+        await query.message.edit_text(
+            f"💳 **DEPOSIT MONEY**\n\n"
+            f"⚠️ **Minimum Deposit Amount:** ₹{MIN_DEPOSIT:.2f}\n\n"
+            f"🔢 **Enter the amount you wish to deposit (in ₹):**",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
         )
 
     elif data == "user_buy_menu":
-        # Group accounts by category, country, year, price
         pipeline = [
             {"$match": {"status": "AVAILABLE"}},
             {"$group": {
@@ -319,7 +330,7 @@ async def callback_router(client: Client, query: CallbackQuery):
                 btn_label += f" (🎁 Cashback ₹{cb})"
             buttons.append([InlineKeyboardButton(btn_label, callback_data=f"buy_cat_{cat}_{country}_{year}_{price}")])
         
-        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="user_main_menu")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")])
         await query.message.edit_text("🌍 **Select an Account Category:**", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("buy_cat_"):
@@ -343,7 +354,6 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         bal = await get_user_balance(user_id)
         if bal < price:
-            # Revert stock if insufficient funds
             await accounts_col.update_one({"_id": acc["_id"]}, {"$set": {"status": "AVAILABLE", "sold_to": None}})
             await query.answer(f"❌ Insufficient Balance! Required: ₹{price}, Available: ₹{bal:.2f}", show_alert=True)
             return
@@ -388,19 +398,19 @@ async def callback_router(client: Client, query: CallbackQuery):
             except Exception as e:
                 await query.message.reply_text(f"⚠️ Session notice: `{e}`")
 
-        # CASHBACK PROMPT AFTER LOGOUT
         cb_info = temp_data.get(user_id)
         if cb_info and cb_info.get("pending_cashback", 0) > 0:
             cb_val = cb_info["pending_cashback"]
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("💳 Add to Main Wallet", callback_data=f"cb_claim_wallet_{cb_val}")],
-                [InlineKeyboardButton("👤 Add to Purchasing Profile", callback_data=f"cb_claim_profile_{cb_val}")]
+                [InlineKeyboardButton("👤 Add to Purchasing Profile", callback_data=f"cb_claim_profile_{cb_val}")],
+                [InlineKeyboardButton("🔙 Main Menu", callback_data="user_main_menu")]
             ])
             await app.send_message(
                 user_id,
                 f"🎉 **You have purchased the cashback account!**\n\n"
                 f"🎁 **Cashback Amount:** ₹{cb_val:.2f}\n"
-                f"Where would you like to add your cashback rewards? *(Note: Wallet balance baad m bhi QR par ₹50 hone par withdraw kar sakte ho)*",
+                f"Where would you like to add your cashback rewards?",
                 reply_markup=kb
             )
 
@@ -408,13 +418,13 @@ async def callback_router(client: Client, query: CallbackQuery):
         amount = float(data.split("_")[3])
         await update_balance(user_id, amount)
         temp_data.pop(user_id, None)
-        await query.message.edit_text(f"✅ **₹{amount:.2f} Cashback credited to your Main Wallet!**")
+        await query.message.edit_text(f"✅ **₹{amount:.2f} Cashback credited to your Main Wallet!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]]))
 
     elif data.startswith("cb_claim_profile_"):
         amount = float(data.split("_")[3])
         await update_profile_cashback(user_id, amount)
         temp_data.pop(user_id, None)
-        await query.message.edit_text(f"✅ **₹{amount:.2f} Cashback saved to your Purchasing Profile!**")
+        await query.message.edit_text(f"✅ **₹{amount:.2f} Cashback saved to your Purchasing Profile!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]]))
 
     elif data == "user_withdraw_menu":
         bal = await get_user_balance(user_id)
@@ -427,12 +437,14 @@ async def callback_router(client: Client, query: CallbackQuery):
             f"💸 **CASHBACK / WALLET WITHDRAWAL**\n\n"
             f"💰 **Available Balance:** ₹{bal:.2f}\n"
             f"⚠️ **Minimum Withdrawal:** ₹{MIN_WITHDRAW:.2f}\n\n"
-            f"🔢 **Enter amount to withdraw:**"
+            f"🔢 **Enter amount to withdraw:**",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
         )
 
-    # ADMIN HANDLERS
+    # ==================== ADMIN PANEL HANDLERS ====================
     elif data == "admin_panel":
         if user_id not in SUDO_USERS: return
+        user_states.pop(user_id, None)
         await query.message.edit_text("⚙️ **Admin Dashboard**", reply_markup=get_admin_panel_keyboard(user_id))
 
     elif data == "admin_add_acc":
@@ -441,31 +453,78 @@ async def callback_router(client: Client, query: CallbackQuery):
             [InlineKeyboardButton("⚡ Temporary Spam", callback_data="adm_cat_Temporary Spam")],
             [InlineKeyboardButton("🚫 Permanent Spam", callback_data="adm_cat_Permanent Spam")],
             [InlineKeyboardButton("✨ Fresh Account", callback_data="adm_cat_Fresh Account")],
-            [InlineKeyboardButton("📜 Old Account", callback_data="adm_cat_Old Account")]
+            [InlineKeyboardButton("📜 Old Account", callback_data="adm_cat_Old Account")],
+            [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
         ])
         await query.message.edit_text("📂 **Select Account Category:**", reply_markup=kb)
+
+    elif data == "admin_change_price":
+        if user_id not in SUDO_USERS: return
+        user_states[user_id] = "ADM_STEP_CHG_PRICE_CAT"
+        await query.message.edit_text(
+            "🏷️ **CHANGE STOCK PRICE**\n\n"
+            "Enter Category, Country, Year & New Price separated by commas.\n"
+            "Format: `Category, Country, Year, NewPrice`\n"
+            "Example: `Fresh Account, India, 2024, 150`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+        )
+
+    elif data == "admin_edit_bal":
+        if user_id not in SUDO_USERS: return
+        user_states[user_id] = "ADM_STEP_EDIT_BAL"
+        await query.message.edit_text(
+            "✏️ **EDIT USER BALANCE**\n\n"
+            "Send User ID and New Balance separated by space.\n"
+            "Format: `UserID NewBalance`\n"
+            "Example: `123456789 500`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+        )
+
+    elif data == "admin_manage_sudo":
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Owner Only Access!", show_alert=True)
+            return
+        user_states[user_id] = "ADM_STEP_MANAGE_SUDO"
+        await query.message.edit_text(
+            "👥 **MANAGE ADMINS**\n\n"
+            "Send `add UserID` to add an admin or `remove UserID` to revoke admin privileges.\n"
+            "Examples:\n`add 123456789`\n`remove 123456789`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+        )
 
     elif data.startswith("adm_cat_"):
         if user_id not in SUDO_USERS: return
         cat = data.split("_")[2]
         temp_data[user_id] = {"category": cat}
         user_states[user_id] = "ADM_STEP_COUNTRY"
-        await query.message.edit_text(f" Selected Category: **{cat}**\n\n📝 **Step 1:** Enter Country Name (e.g. `India`, `USA`):")
+        await query.message.edit_text(
+            f" Selected Category: **{cat}**\n\n📝 **Step 1:** Enter Country Name (e.g. `India`, `USA`):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+        )
 
     elif data == "admin_broadcast":
         if user_id not in SUDO_USERS: return
         user_states[user_id] = "ADM_STEP_BROADCAST"
-        await query.message.edit_text("📢 **Send the message you want to Broadcast in DM to all users:**")
+        await query.message.edit_text(
+            "📢 **Send the message you want to Broadcast in DM to all users:**",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+        )
 
     elif data == "admin_ban_user":
         if user_id not in SUDO_USERS: return
         user_states[user_id] = "ADM_STEP_BAN_ID"
-        await query.message.edit_text("🚫 **Enter User ID or @Username to Ban:**")
+        await query.message.edit_text(
+            "🚫 **Enter User ID or @Username to Ban:**",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+        )
 
     elif data == "admin_unban_user":
         if user_id not in SUDO_USERS: return
         user_states[user_id] = "ADM_STEP_UNBAN_ID"
-        await query.message.edit_text("🟢 **Enter User ID or @Username to Unban:**")
+        await query.message.edit_text(
+            "🟢 **Enter User ID or @Username to Unban:**",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+        )
 
     # WITHDRAWAL AND DEPOSIT SINGLE APPROVAL ENGINE
     elif data.startswith("adm_app_dep_"):
@@ -474,7 +533,6 @@ async def callback_router(client: Client, query: CallbackQuery):
         dep_user_id = int(dep_user_id)
         amount = float(amount)
 
-        # Concurrency Lock
         res = await requests_col.find_one_and_update({"_id": req_id, "status": "PENDING"}, {"$set": {"status": "APPROVED"}})
         if not res:
             await query.answer("⚠️ Already processed by another admin!", show_alert=True)
@@ -531,10 +589,8 @@ async def photo_receiver(client: Client, message: Message):
         amount = temp_data[user_id]["withdraw_amount"]
         user_states.pop(user_id, None)
 
-        # Deduct Balance
         await update_balance(user_id, -amount)
 
-        # Create lock record
         req_doc = {"type": "WITHDRAW", "status": "PENDING"}
         req_res = await requests_col.insert_one(req_doc)
         req_id = str(req_res.inserted_id)
@@ -552,7 +608,6 @@ async def photo_receiver(client: Client, message: Message):
             f"📌 **Status:** Pending payment to QR below."
         )
 
-        # Send STRICTLY to OWNER_ID
         try:
             await app.send_photo(chat_id=OWNER_ID, photo=qr_photo_id, caption=caption, reply_markup=kb)
         except Exception as e:
@@ -639,7 +694,67 @@ async def text_router(client: Client, message: Message):
             except Exception as e:
                 logging.error(f"Failed sending DM to Admin {sudo_id}: {e}")
 
-    # BROADCAST HANDLER
+    # ADMIN PANEL: CHANGE STOCK PRICE
+    elif state == "ADM_STEP_CHG_PRICE_CAT":
+        try:
+            raw_input = [i.strip() for i in message.text.split(",")]
+            if len(raw_input) != 4:
+                await message.reply_text("❌ Invalid Format! Use: `Category, Country, Year, NewPrice`")
+                return
+            
+            cat, country, year, new_price = raw_input[0], raw_input[1], raw_input[2], float(raw_input[3])
+            
+            res = await accounts_col.update_many(
+                {"category": cat, "country": country, "year": year, "status": "AVAILABLE"},
+                {"$set": {"price": new_price}}
+            )
+
+            user_states.pop(user_id, None)
+            await message.reply_text(
+                f"✅ **Price Updated!**\n\nUpdated {res.modified_count} available accounts in category `{cat}` ({country} {year}) to ₹{new_price:.2f}.",
+                reply_markup=get_admin_panel_keyboard(user_id)
+            )
+        except ValueError:
+            await message.reply_text("❌ Price must be a valid number!")
+
+    # ADMIN PANEL: EDIT BALANCE
+    elif state == "ADM_STEP_EDIT_BAL":
+        try:
+            parts = message.text.strip().split()
+            if len(parts) != 2:
+                await message.reply_text("❌ Invalid Format! Use: `UserID NewBalance`")
+                return
+
+            t_user_id = int(parts[0])
+            n_bal = float(parts[1])
+
+            await set_user_balance(t_user_id, n_bal)
+            user_states.pop(user_id, None)
+            await message.reply_text(
+                f"✅ User balance updated!\n👤 User ID: `{t_user_id}`\n💰 New Balance: ₹{n_bal:.2f}",
+                reply_markup=get_admin_panel_keyboard(user_id)
+            )
+        except ValueError:
+            await message.reply_text("❌ Check your input numbers!")
+
+    # ADMIN PANEL: MANAGE SUDO
+    elif state == "ADM_STEP_MANAGE_SUDO":
+        if user_id != OWNER_ID: return
+        parts = message.text.strip().split()
+        if len(parts) != 2 or parts[0].lower() not in ["add", "remove"]:
+            await message.reply_text("❌ Invalid command format! Use `add UserID` or `remove UserID`")
+            return
+
+        action, target_id = parts[0].lower(), int(parts[1])
+        if action == "add":
+            await add_sudo_user(target_id)
+            await message.reply_text(f"✅ User `{target_id}` added to Admins list.", reply_markup=get_admin_panel_keyboard(user_id))
+        else:
+            await remove_sudo_user(target_id)
+            await message.reply_text(f"🗑️ User `{target_id}` removed from Admins list.", reply_markup=get_admin_panel_keyboard(user_id))
+        user_states.pop(user_id, None)
+
+    # ADMIN PANEL: BROADCAST HANDLER
     elif state == "ADM_STEP_BROADCAST":
         user_states.pop(user_id, None)
         broadcast_msg = message.text
@@ -658,9 +773,9 @@ async def text_router(client: Client, message: Message):
             except Exception:
                 failed += 1
 
-        await message.reply_text(f"✅ **Broadcast Completed!**\n\n🟢 Delivered: {success}\n🔴 Failed: {failed}")
+        await message.reply_text(f"✅ **Broadcast Completed!**\n\n🟢 Delivered: {success}\n🔴 Failed: {failed}", reply_markup=get_admin_panel_keyboard(user_id))
 
-    # BAN / UNBAN REASON FLOW HANDLERS
+    # ADMIN PANEL: BAN / UNBAN
     elif state == "ADM_STEP_BAN_ID":
         try:
             target_user = (await client.get_users(message.text.strip())).id
@@ -676,7 +791,7 @@ async def text_router(client: Client, message: Message):
         user_states.pop(user_id, None)
 
         await users_col.update_one({"user_id": target_user}, {"$set": {"is_banned": True, "ban_reason": reason}}, upsert=True)
-        await message.reply_text(f"🚫 User `{target_user}` banned.\n**Reason:** {reason}")
+        await message.reply_text(f"🚫 User `{target_user}` banned.\n**Reason:** {reason}", reply_markup=get_admin_panel_keyboard(user_id))
         
         try:
             await app.send_message(target_user, f"🚫 **You have been banned from the bot.**\n\n**Reason:** {reason}")
@@ -688,7 +803,7 @@ async def text_router(client: Client, message: Message):
             target_user = (await client.get_users(message.text.strip())).id
             user_states.pop(user_id, None)
             await users_col.update_one({"user_id": target_user}, {"$set": {"is_banned": False, "ban_reason": ""}})
-            await message.reply_text(f"🟢 User `{target_user}` is now Unbanned.")
+            await message.reply_text(f"🟢 User `{target_user}` is now Unbanned.", reply_markup=get_admin_panel_keyboard(user_id))
             try:
                 await app.send_message(target_user, "🎉 **Your account has been unbanned by Admin!** You can use the bot again.")
             except Exception:
