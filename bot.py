@@ -876,7 +876,7 @@ async def text_router(client: Client, message: Message):
 
             # Anti-Self/Admin Ban Check
             if target_user == OWNER_ID or target_user in SUDO_USERS:
-                await message.reply_text("❌ Jhol alert! Aap khud ko ya kisi aur admin ko ban nahi kar sakte.")
+                await message.reply_text("❌ You cannot ban yourself or another admin.")
                 user_states.pop(user_id, None)
                 return
 
