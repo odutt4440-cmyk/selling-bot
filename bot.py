@@ -23,7 +23,7 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 # Supports both Channel or Group ID (-100xxxxxxxxx)
-LOG_CHANNEL_ID = "bwuahahahahaa"
+LOG_CHANNEL_ID = "PAPASELLINGGROUP_CHAT"
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 UPI_ID_TEXT = os.getenv("UPI_ID_TEXT", "yourupi@bank")
