@@ -29,7 +29,7 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 UPI_ID_TEXT = os.getenv("UPI_ID_TEXT", "yourupi@bank")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "Account Store")
 
-MIN_DEPOSIT = 50.0
+MIN_DEPOSIT = 10.0
 MIN_WITHDRAW = 50.0
 
 logging.basicConfig(level=logging.INFO)
