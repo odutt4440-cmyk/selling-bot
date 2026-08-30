@@ -22,7 +22,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-# Supports both Channel or Group ID (-100xxxxxxxxx)
+
 LOG_CHANNEL_ID = "PAPASELLINGGROUP_CHAT"
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -36,12 +36,13 @@ logging.basicConfig(level=logging.INFO)
 
 # ==================== MONGO DB INITIALIZATION ====================
 mongo_client = AsyncIOMotorClient(MONGO_URI)
-db = mongo_client["shop_bot_db"]
+db = mongo_client["swastik_shop_db"]
 
 users_col = db["users"]
 accounts_col = db["accounts"]
 sudo_col = db["sudo_users"]
 requests_col = db["requests"]
+settings_col = db["settings"]
 
 SUDO_USERS = set()
 
@@ -51,6 +52,14 @@ async def init_db():
     sudo_docs = await sudo_col.find().to_list(length=1000)
     SUDO_USERS = {doc["user_id"] for doc in sudo_docs}
     SUDO_USERS.add(OWNER_ID)
+    
+    m_doc = await settings_col.find_one({"key": "maintenance"})
+    if not m_doc:
+        await settings_col.insert_one({
+            "key": "maintenance",
+            "is_active": False,
+            "reason": "Routine system maintenance and performance upgrades in progress."
+        })
 
 # ==================== BOT CLIENT SETUP ====================
 app = Client("ShopBotGUI", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -59,6 +68,18 @@ user_states = {}
 temp_data = {}
 
 # ==================== HELPER DB FUNCTIONS ====================
+async def get_maintenance_status() -> tuple[bool, str]:
+    m_doc = await settings_col.find_one({"key": "maintenance"})
+    if not m_doc:
+        return False, "Routine system maintenance and performance upgrades in progress."
+    return m_doc.get("is_active", False), m_doc.get("reason", "Routine system maintenance and performance upgrades in progress.")
+
+async def set_maintenance_status(is_active: bool, reason: str = None):
+    update_data = {"is_active": is_active}
+    if reason is not None:
+        update_data["reason"] = reason
+    await settings_col.update_one({"key": "maintenance"}, {"$set": update_data}, upsert=True)
+
 def mask_phone_number(phone: str) -> str:
     if len(phone) > 5:
         return phone[:5] + "X" * (len(phone) - 5)
@@ -113,7 +134,7 @@ async def log_to_channel(text: str, reply_markup=None):
 
 def get_buy_now_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛒 Buy Now", url="https://t.me/swastiktgs_bot")]
+        [InlineKeyboardButton("🛒 Buy Now", url="https://t.me/papaotpsell_bot")]
     ])
 
 def generate_upi_qr(upi_id: str, name: str, amount: float = None) -> io.BytesIO:
@@ -138,7 +159,6 @@ def get_account_options_keyboard(acc_id: str):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Re-fetch OTP", callback_data=f"refetch_otp_{acc_id}")],
         [InlineKeyboardButton("📱 Manage Devices", callback_data=f"manage_devs_{acc_id}")],
-        [InlineKeyboardButton("🛠️ Terminate Other Sessions", callback_data=f"term_sess_{acc_id}")],
         [InlineKeyboardButton("🚪 Finish & Logout Bot", callback_data=f"logout_bot_{acc_id}")],
         [InlineKeyboardButton("🔙 Main Menu", callback_data="user_main_menu")]
     ])
@@ -185,7 +205,6 @@ async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
                 reply_markup=get_account_options_keyboard(acc_id)
             )
             
-            # Detailed Log on OTP Received (Masked Phone)
             masked_phone = mask_phone_number(phone_number)
             log_text = (
                 f"✅ **LOGIN OTP RECEIVED!**\n\n"
@@ -259,13 +278,33 @@ def get_admin_panel_keyboard(user_id: int):
     if user_id == OWNER_ID:
         buttons.append([InlineKeyboardButton("✏️ Edit User Balance", callback_data="admin_edit_bal")])
         
-    buttons.append([InlineKeyboardButton("📢 Broadcast DM", callback_data="admin_broadcast")])
+    buttons.append([
+        InlineKeyboardButton("📊 Stats & Revenue", callback_data="admin_stats"),
+        InlineKeyboardButton("ℹ️ User History & Info", callback_data="admin_user_history")
+    ])
+
+    buttons.append([
+        InlineKeyboardButton("🛠️ Maintenance Mode", callback_data="admin_maint_panel"),
+        InlineKeyboardButton("📢 Broadcast DM", callback_data="admin_broadcast")
+    ])
+    
     buttons.append([InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban_user"), InlineKeyboardButton("🟢 Unban User", callback_data="admin_unban_user")])
     
     if user_id == OWNER_ID:
         buttons.append([InlineKeyboardButton("👥 Manage Admins (Owner Only)", callback_data="admin_manage_sudo")])
     
     buttons.append([InlineKeyboardButton("🔙 Exit Admin Panel", callback_data="user_main_menu")])
+    return InlineKeyboardMarkup(buttons)
+
+async def get_maintenance_panel_keyboard():
+    is_active, _ = await get_maintenance_status()
+    toggle_text = "🔴 Turn OFF Maintenance" if is_active else "🟢 Turn ON Maintenance"
+    
+    buttons = [
+        [InlineKeyboardButton(toggle_text, callback_data="adm_toggle_maint")],
+        [InlineKeyboardButton("✏️ Change Maintenance Reason", callback_data="adm_change_maint_reason")],
+        [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]
+    ]
     return InlineKeyboardMarkup(buttons)
 
 async def get_manage_sudo_keyboard():
@@ -285,11 +324,17 @@ async def get_manage_sudo_keyboard():
 async def start_handler(client: Client, message: Message):
     user_id = message.from_user.id
     user_states.pop(user_id, None)
+
     banned, reason = await is_banned(user_id)
     if banned:
         await message.reply_text(f"🚫 **You are banned from using this bot.**\n\n**Reason:** {reason}")
         return
-        
+
+    maint_active, maint_reason = await get_maintenance_status()
+    if maint_active and user_id not in SUDO_USERS:
+        await message.reply_text(f"🚧 **SYSTEM MAINTENANCE MODE ACTIVE** 🚧\n\n**Message:** {maint_reason}\n\n*All bot operations are temporarily paused. Please try again later.*")
+        return
+
     bal = await get_user_balance(user_id)
     text = f"👋 **Welcome to the Account Store Bot!**\n\n🆔 **User ID:** `{user_id}`\n💰 **Wallet Balance:** ₹{bal:.2f}"
     await message.reply_text(text, reply_markup=get_main_menu_keyboard(user_id))
@@ -312,6 +357,11 @@ async def callback_router(client: Client, query: CallbackQuery):
     banned, reason = await is_banned(user_id)
     if banned:
         await query.answer(f"🚫 You are banned! Reason: {reason}", show_alert=True)
+        return
+
+    maint_active, maint_reason = await get_maintenance_status()
+    if maint_active and user_id not in SUDO_USERS and not data.startswith("admin_"):
+        await query.answer(f"🚧 Bot is under maintenance!\nReason: {maint_reason}", show_alert=True)
         return
 
     if data == "user_main_menu":
@@ -417,7 +467,6 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         await query.message.edit_text(msg, reply_markup=get_account_options_keyboard(acc_id))
 
-        # Full Purchase Log with User ID, Category, Price & Cashback (Masked Phone)
         masked_phone = mask_phone_number(phone)
         log_text = (
             f"🛒 **NEW NUMBER PURCHASED!**\n\n"
@@ -459,23 +508,32 @@ async def callback_router(client: Client, query: CallbackQuery):
             await t_client.disconnect()
 
             dev_text = f"📱 **Active Devices List for** `{acc['phone_number']}`:\n\n"
+            buttons = []
+
             for idx, auth in enumerate(authorizations.authorizations, 1):
-                current_mark = " (Current Session)" if auth.current else ""
+                is_curr = " (Current Session)" if auth.current else ""
                 dev_text += (
-                    f"**{idx}. {auth.device_model}**{current_mark}\n"
+                    f"**{idx}. {auth.device_model}**{is_curr}\n"
                     f"▫️ **App:** {auth.app_name} ({auth.app_version})\n"
                     f"▫️ **System:** {auth.platform} ({auth.system_version})\n"
-                    f"▫️ **IP / Location:** `{auth.ip}` ({auth.country})\n\n"
+                    f"▫️ **IP:** `{auth.ip}` ({auth.country})\n\n"
                 )
+                
+                # Dynamic terminate buttons for each device session
+                btn_label = f"❌ Terminate {auth.device_model}" + (" (Current)" if auth.current else "")
+                buttons.append([InlineKeyboardButton(btn_label, callback_data=f"term_hash_{acc_id}_{auth.hash}")])
 
-            await query.message.reply_text(dev_text, reply_markup=get_account_options_keyboard(acc_id))
+            buttons.append([InlineKeyboardButton("🔙 Back to Options", callback_data=f"refetch_otp_{acc_id}")])
+            await query.message.reply_text(dev_text, reply_markup=InlineKeyboardMarkup(buttons))
 
         except Exception as e:
             await query.message.reply_text(f"❌ Error fetching active devices: `{e}`")
 
-    elif data.startswith("term_sess_"):
-        acc_id = data.split("_")[2]
-        await query.answer("🛠️ Terminating other sessions...", show_alert=False)
+    elif data.startswith("term_hash_"):
+        parts = data.split("_")
+        acc_id, hash_val = parts[2], int(parts[3])
+        
+        await query.answer("🛠️ Terminating selected session...", show_alert=False)
         acc = await accounts_col.find_one({"_id": ObjectId(acc_id)})
         
         if not acc:
@@ -490,29 +548,18 @@ async def callback_router(client: Client, query: CallbackQuery):
                 await query.message.reply_text(f"⚠️ **Account Session Expired or Closed:** `{acc['phone_number']}`")
                 return
 
-            authorizations = await t_client(GetAuthorizationsRequest())
-            terminated_count = 0
-            
-            for auth in authorizations.authorizations:
-                if not auth.current:
-                    try:
-                        await t_client(ResetAuthorizationRequest(hash=auth.hash))
-                        terminated_count += 1
-                    except FreshResetAuthorisationForbiddenError:
-                        await query.message.reply_text("⚠️ **Telegram Security Restriction:** New sessions cannot terminate other devices within 24 hours.")
-                        break
-                    except Exception as err:
-                        logging.error(f"Failed to terminate session hash {auth.hash}: {err}")
+            try:
+                await t_client(ResetAuthorizationRequest(hash=hash_val))
+                await query.message.reply_text("✅ **Device session terminated successfully!**")
+            except FreshResetAuthorisationForbiddenError:
+                await query.message.reply_text("⚠️ **Telegram Security Restriction:** New sessions cannot terminate other devices within 24 hours.")
+            except Exception as err:
+                await query.message.reply_text(f"❌ Failed to terminate device session: `{err}`")
 
             await t_client.disconnect()
-            if terminated_count > 0:
-                await query.message.reply_text(
-                    f"✅ **Terminated {terminated_count} other sessions successfully!**",
-                    reply_markup=get_account_options_keyboard(acc_id)
-                )
 
         except Exception as e:
-            await query.message.reply_text(f"❌ Failed to terminate other sessions: `{e}`")
+            await query.message.reply_text(f"❌ Error connecting to session: `{e}`")
 
     elif data.startswith("logout_bot_"):
         acc_id = data.split("_")[2]
@@ -577,6 +624,105 @@ async def callback_router(client: Client, query: CallbackQuery):
         user_states.pop(user_id, None)
         await query.message.edit_text("⚙️ **Admin Dashboard**", reply_markup=get_admin_panel_keyboard(user_id))
 
+    elif data == "admin_maint_panel":
+        if user_id not in SUDO_USERS: return
+        user_states.pop(user_id, None)
+        is_active, reason = await get_maintenance_status()
+        status_text = "🟢 **ONLINE (Active)**" if not is_active else "🔴 **MAINTENANCE MODE (Paused)**"
+        kb = await get_maintenance_panel_keyboard()
+        await query.message.edit_text(
+            f"🛠️ **MAINTENANCE CONTROL PANEL**\n\n"
+            f"📊 **Current Status:** {status_text}\n"
+            f"📝 **Reason / Message:**\n`{reason}`\n\n"
+            f"Toggle maintenance status or modify the maintenance message using options below:",
+            reply_markup=kb
+        )
+
+    elif data == "adm_toggle_maint":
+        if user_id not in SUDO_USERS: return
+        is_active, reason = await get_maintenance_status()
+        new_state = not is_active
+        await set_maintenance_status(new_state)
+        
+        state_str = "ENABLED" if new_state else "DISABLED"
+        await query.answer(f"✅ Maintenance Mode {state_str}!", show_alert=True)
+        
+        status_text = "🟢 **ONLINE (Active)**" if not new_state else "🔴 **MAINTENANCE MODE (Paused)**"
+        kb = await get_maintenance_panel_keyboard()
+        await query.message.edit_text(
+            f"🛠️ **MAINTENANCE CONTROL PANEL**\n\n"
+            f"📊 **Current Status:** {status_text}\n"
+            f"📝 **Reason / Message:**\n`{reason}`\n\n"
+            f"Toggle maintenance status or modify the maintenance message using options below:",
+            reply_markup=kb
+        )
+
+    elif data == "adm_change_maint_reason":
+        if user_id not in SUDO_USERS: return
+        user_states[user_id] = "ADM_STEP_MAINT_REASON"
+        await query.message.edit_text(
+            "✏️ **SET MAINTENANCE REASON / TEXT**\n\n"
+            "Send the text or reason to show users when maintenance mode is active:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Maintenance Panel", callback_data="admin_maint_panel")]])
+        )
+
+    elif data == "admin_stats":
+        if user_id not in SUDO_USERS: return
+        await query.answer("📊 Calculating revenue & stats...", show_alert=False)
+        
+        total_users = await users_col.count_documents({})
+        banned_users = await users_col.count_documents({"is_banned": True})
+        
+        available_stock = await accounts_col.count_documents({"status": "AVAILABLE"})
+        sold_stock = await accounts_col.count_documents({"status": "SOLD"})
+        
+        revenue_pipeline = [
+            {"$match": {"status": "SOLD"}},
+            {"$group": {
+                "_id": None,
+                "total_rev": {"$sum": "$price"},
+                "total_cb": {"$sum": "$cashback"}
+            }}
+        ]
+        rev_res = await accounts_col.aggregate(revenue_pipeline).to_list(length=1)
+        
+        total_revenue = rev_res[0]["total_rev"] if rev_res else 0.0
+        total_cashback_issued = rev_res[0]["total_cb"] if rev_res else 0.0
+
+        user_cb_pipeline = [
+            {"$group": {
+                "_id": None,
+                "total_claimed_cb": {"$sum": "$profile_cashback"}
+            }}
+        ]
+        user_cb_res = await users_col.aggregate(user_cb_pipeline).to_list(length=1)
+        profile_cb_claimed = user_cb_res[0]["total_claimed_cb"] if user_cb_res else 0.0
+
+        stats_text = (
+            f"📊 **BOT STATISTICS & REVENUE METRICS**\n\n"
+            f"💰 **Total Revenue:** ₹{total_revenue:.2f}\n"
+            f"🎁 **Total Cashback Issued:** ₹{total_cashback_issued:.2f}\n"
+            f"👤 **Profile Cashback Claimed:** ₹{profile_cb_claimed:.2f}\n\n"
+            f"📦 **Available Stock:** {available_stock} accounts\n"
+            f"🛍️ **Total Accounts Sold:** {sold_stock} accounts\n\n"
+            f"👥 **Total Registered Users:** {total_users}\n"
+            f"🚫 **Banned Users:** {banned_users}\n"
+            f"👨‍💻 **Total Admins:** {len(SUDO_USERS)}"
+        )
+        await query.message.edit_text(
+            stats_text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+        )
+
+    elif data == "admin_user_history":
+        if user_id not in SUDO_USERS: return
+        user_states[user_id] = "ADM_STEP_GET_USER_HISTORY"
+        await query.message.edit_text(
+            "ℹ️ **FETCH USER DETAILS & HISTORY**\n\n"
+            "Send the **User ID** of the user whose complete information and history you want to check:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+        )
+
     elif data == "admin_add_acc":
         if user_id not in SUDO_USERS: return
         kb = InlineKeyboardMarkup([
@@ -606,7 +752,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         stocks = await accounts_col.aggregate(pipeline).to_list(length=100)
 
         if not stocks:
-            await query.answer("❌ Current mein koi active stock available nahi hai!", show_alert=True)
+            await query.answer("❌ No active stock currently available!", show_alert=True)
             return
 
         buttons = []
@@ -622,7 +768,7 @@ async def callback_router(client: Client, query: CallbackQuery):
             buttons.append([InlineKeyboardButton(btn_label, callback_data=f"adm_rmstock_confirm_{cat}_{country}_{year}_{price}")])
 
         buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
-        await query.message.edit_text("🗑️ **Select Stock Item to Remove/Delete:**\n\n*(Is button par click karte hi yeh stock users list se turant automatically hide ho jayega)*", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.message.edit_text("🗑️ **Select Stock Item to Remove/Delete:**\n\n*(Clicking a button will immediately remove the stock item from availability)*", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("adm_rmstock_confirm_"):
         if user_id not in SUDO_USERS: return
@@ -738,10 +884,10 @@ async def callback_router(client: Client, query: CallbackQuery):
             return
         user_states[user_id] = "ADM_STEP_EDIT_BAL"
         await query.message.edit_text(
-            "✏️ **EDIT USER BALANCE**\n\n"
-            "Send User ID and New Balance separated by space.\n"
-            "Format: `UserID NewBalance`\n"
-            "Example: `123456789 500`",
+            "✏️ **ADD USER BALANCE**\n\n"
+            "Send User ID and Balance to Add separated by space.\n"
+            "Format: `UserID BalanceToAdd`\n"
+            "Example: `123456789 5`",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
         )
 
@@ -823,7 +969,6 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **APPROVED (+₹{amount:.2f})** by {admin_mention}")
         await app.send_message(dep_user_id, f"🎉 **Deposit Approved!** ₹{amount:.2f} credited to your wallet.")
         
-        # Detailed Approved Deposit Log
         log_text = (
             f"💳 **NEW DEPOSIT APPROVED!**\n\n"
             f"👤 **User ID:** `{dep_user_id}`\n"
@@ -871,7 +1016,6 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **WITHDRAW SUCCESSFUL! Money Sent.**")
         await app.send_message(w_user_id, f"🎉 **Withdrawal Successful!** ₹{amount:.2f} has been transferred to your QR code.")
 
-        # Detailed Withdrawal Log
         log_text = (
             f"💸 **NEW WITHDRAWAL PROCESSED!**\n\n"
             f"👤 **User ID:** `{w_user_id}`\n"
@@ -885,6 +1029,16 @@ async def callback_router(client: Client, query: CallbackQuery):
 async def photo_receiver(client: Client, message: Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
+
+    banned, reason = await is_banned(user_id)
+    if banned:
+        await message.reply_text(f"🚫 **You are banned from using this bot.**\n\n**Reason:** {reason}")
+        return
+
+    maint_active, maint_reason = await get_maintenance_status()
+    if maint_active and user_id not in SUDO_USERS:
+        await message.reply_text(f"🚧 **SYSTEM MAINTENANCE MODE ACTIVE** 🚧\n\n**Message:** {maint_reason}")
+        return
 
     if state == "WAIT_DEPOSIT_PHOTO":
         temp_data[user_id]["photo_id"] = message.photo.file_id
@@ -926,10 +1080,72 @@ async def text_router(client: Client, message: Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
 
+    banned, reason = await is_banned(user_id)
+    if banned:
+        await message.reply_text(f"🚫 **You are banned from using this bot.**\n\n**Reason:** {reason}")
+        return
+
+    maint_active, maint_reason = await get_maintenance_status()
+    if maint_active and user_id not in SUDO_USERS and not state.startswith("ADM_"):
+        await message.reply_text(f"🚧 **SYSTEM MAINTENANCE MODE ACTIVE** 🚧\n\n**Message:** {maint_reason}")
+        return
+
     if not state:
         return
 
-    if state == "WAIT_WITHDRAW_AMOUNT":
+    if state == "ADM_STEP_GET_USER_HISTORY":
+        if user_id not in SUDO_USERS: return
+        try:
+            target_id = int(message.text.strip())
+            u_data = await users_col.find_one({"user_id": target_id})
+            
+            if not u_data:
+                await message.reply_text(
+                    f"❌ **User ID `{target_id}` not found in Database!**",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+                )
+                user_states.pop(user_id, None)
+                return
+
+            purchased_accs = await accounts_col.find({"sold_to": target_id, "status": "SOLD"}).to_list(length=100)
+            
+            history_text = ""
+            if purchased_accs:
+                history_text = "\n\n📦 **Purchased Accounts History:**\n"
+                for idx, acc in enumerate(purchased_accs, 1):
+                    history_text += f"{idx}. `{acc.get('phone_number')}` | {acc.get('category')} ({acc.get('country')} {acc.get('year')}) | ₹{acc.get('price', 0.0):.2f}\n"
+            else:
+                history_text = "\n\n📦 **Purchased Accounts History:** No accounts purchased yet."
+
+            status_ban = "🚫 Banned" if u_data.get("is_banned", False) else "🟢 Active"
+            ban_reason = f"\n⚠️ **Ban Reason:** {u_data.get('ban_reason')}" if u_data.get("is_banned", False) else ""
+
+            info_msg = (
+                f"👤 **USER DETAILED INFO & HISTORY**\n\n"
+                f"🆔 **User ID:** `{target_id}`\n"
+                f"📌 **Account Status:** {status_ban}{ban_reason}\n"
+                f"💵 **Wallet Balance:** ₹{u_data.get('balance', 0.0):.2f}\n"
+                f"🎁 **Profile Cashback:** ₹{u_data.get('profile_cashback', 0.0):.2f}\n"
+                f"🛍️ **Total Accounts Bought:** {len(purchased_accs)}"
+                f"{history_text}"
+            )
+
+            user_states.pop(user_id, None)
+            await message.reply_text(info_msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]]))
+            
+        except ValueError:
+            await message.reply_text("❌ Invalid User ID! Please enter numeric User ID only:")
+
+    elif state == "ADM_STEP_MAINT_REASON":
+        if user_id not in SUDO_USERS: return
+        new_reason = message.text.strip()
+        is_active, _ = await get_maintenance_status()
+        await set_maintenance_status(is_active, new_reason)
+        user_states.pop(user_id, None)
+        kb = await get_maintenance_panel_keyboard()
+        await message.reply_text(f"✅ **Maintenance Reason Updated!**\n\n`{new_reason}`", reply_markup=kb)
+
+    elif state == "WAIT_WITHDRAW_AMOUNT":
         try:
             amount = float(message.text.strip())
             bal = await get_user_balance(user_id)
@@ -1034,16 +1250,21 @@ async def text_router(client: Client, message: Message):
         try:
             parts = message.text.strip().split()
             if len(parts) != 2:
-                await message.reply_text("❌ Invalid Format! Use: `UserID NewBalance`")
+                await message.reply_text("❌ Invalid Format! Use: `UserID BalanceToAdd`")
                 return
 
             t_user_id = int(parts[0])
-            n_bal = float(parts[1])
+            add_amount = float(parts[1])
 
-            await set_user_balance(t_user_id, n_bal)
+            await update_balance(t_user_id, add_amount)
+            new_total = await get_user_balance(t_user_id)
+            
             user_states.pop(user_id, None)
             await message.reply_text(
-                f"✅ User balance updated!\n👤 User ID: `{t_user_id}`\n💰 New Balance: ₹{n_bal:.2f}",
+                f"✅ **Balance Added Successfully!**\n\n"
+                f"👤 User ID: `{t_user_id}`\n"
+                f"➕ Added Amount: ₹{add_amount:.2f}\n"
+                f"💰 New Balance: ₹{new_total:.2f}",
                 reply_markup=get_admin_panel_keyboard(user_id)
             )
         except ValueError:
