@@ -28,6 +28,7 @@ LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "")
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 UPI_ID_TEXT = os.getenv("UPI_ID_TEXT", "yourupi@bank")
+BINANCE_ID = os.getenv("BINANCE_ID", "0xYourBinanceUSDTAddressHere")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "Account Store")
 PAYMENT_API_KEY = os.getenv("PAYMENT_API_KEY", "")
 
@@ -97,6 +98,7 @@ app = Client("ShopBotGUI", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN
 
 user_states = {}
 temp_data = {}
+admin_deposit_msg_map = {}
 
 # ==================== HELPER DB FUNCTIONS ====================
 async def get_maintenance_status() -> tuple[bool, str]:
@@ -310,7 +312,7 @@ async def listen_for_otp(user_id: int, phone_number: str, session_string: str, t
 def get_main_menu_keyboard(user_id: int):
     buttons = [
         [InlineKeyboardButton("🛒 Buy Telegram Account", callback_data="user_buy_menu")],
-        [InlineKeyboardButton("💳 Deposit Money", callback_data="user_deposit_mode_choice"), InlineKeyboardButton("💸 Withdraw Cashback", callback_data="user_withdraw_menu")],
+        [InlineKeyboardButton("💳 Deposit Money (UPI/Crypto)", callback_data="user_deposit_mode_choice"), InlineKeyboardButton("💸 Withdraw Cashback", callback_data="user_withdraw_menu")],
         [InlineKeyboardButton("👤 Profile", callback_data="user_profile"), InlineKeyboardButton("👨‍💻 Support", url="https://t.me/PROOF_PAYMENTS12")]
     ]
     if user_id in SUDO_USERS:
@@ -439,17 +441,17 @@ async def callback_router(client: Client, query: CallbackQuery):
     # ==================== DEPOSIT MODE CHOICE ====================
     elif data == "user_deposit_mode_choice":
         buttons = [
-            [InlineKeyboardButton("⚡ Automatic Payment (UPI)", callback_data="dep_mode_auto")],
+            [InlineKeyboardButton("⚡ Automatic Payment (UPI / INR)", callback_data="dep_mode_auto")],
             [InlineKeyboardButton("🟡 Crypto Deposit (USDT)", callback_data="dep_mode_crypto")],
-            [InlineKeyboardButton("✍️ Manual Deposit", callback_data="dep_mode_manual")],
+            [InlineKeyboardButton("✍️ Manual Deposit (UPI / INR)", callback_data="dep_mode_manual")],
             [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]
         ]
         await query.message.edit_text(
             "💳 **DEPOSIT MONEY MENU**\n\n"
             "Please select how you would like to deposit funds:\n\n"
-            "• **Automatic Payment:** Instantly verified after checking payment.\n"
+            "• **Automatic Payment (UPI / INR):** Instantly verified after checking payment.\n"
             "• **Crypto Deposit (USDT):** Pay via Binance / USDT Payment Gateways.\n"
-            "• **Manual Payment:** Proof verified by Admin manually.",
+            "• **Manual Payment (UPI / INR):** Proof verified by Admin manually.",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
@@ -460,16 +462,16 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_text(
             "🟡 **USDT / CRYPTO DEPOSIT (BINANCE)**\n\n"
             "To deposit using USDT / Crypto:\n\n"
-            "📌 **Pay USDT Address:** `0xYourUSDTBinanceDepositAddressHere`\n"
-            "▫️ **Network:** BEP20 / TRC20\n\n"
-            "After sending crypto, please send the TxHash / Proof to Support for instant balance update.",
+            f"📌 **Binance ID / Pay Address:** `{BINANCE_ID}`\n"
+            "▫️ **Network:** BEP20 / TRC20 / Binance Pay ID\n\n"
+            "After sending crypto, please send the TxHash / Proof to Support for manual balance update.",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
     elif data == "dep_mode_manual":
         user_states[user_id] = "WAIT_DEPOSIT_AMOUNT_MANUAL"
         await query.message.edit_text(
-            f"✍️ **MANUAL DEPOSIT MONEY**\n\n"
+            f"✍️ **MANUAL DEPOSIT MONEY (UPI / INR)**\n\n"
             f"⚠️ **Minimum Deposit Amount:** ₹{MIN_DEPOSIT:.2f}\n\n"
             f"🔢 **Enter the amount you wish to deposit (in ₹):**",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
@@ -478,7 +480,7 @@ async def callback_router(client: Client, query: CallbackQuery):
     elif data == "dep_mode_auto":
         user_states[user_id] = "WAIT_DEPOSIT_AMOUNT_AUTO"
         await query.message.edit_text(
-            f"⚡ **AUTOMATIC DEPOSIT MONEY**\n\n"
+            f"⚡ **AUTOMATIC DEPOSIT MONEY (UPI / INR)**\n\n"
             f"⚠️ **Minimum Deposit Amount:** ₹{MIN_DEPOSIT:.2f}\n\n"
             f"🔢 **Enter the amount you wish to deposit (in ₹):**",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
@@ -1078,7 +1080,7 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         res = await requests_col.find_one_and_update(
             {"_id": ObjectId(req_id), "status": "PENDING"},
-            {"$set": {"status": "APPROVED"}}
+            {"$set": {"status": "APPROVED", "approved_by": user_id}}
         )
 
         if not res:
@@ -1087,8 +1089,31 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         await update_balance(dep_user_id, amount)
         admin_mention = query.from_user.mention
-        await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **APPROVED (+₹{amount:.2f})** by {admin_mention}")
+
+        # Synchronize and update across all admin message entries
+        msg_entries = admin_deposit_msg_map.pop(req_id, [])
+        for adm_id, msg_id in msg_entries:
+            try:
+                await app.edit_message_caption(
+                    chat_id=adm_id,
+                    message_id=msg_id,
+                    caption=query.message.caption + f"\n\n✅ **APPROVED (+₹{amount:.2f})** by {admin_mention}",
+                    reply_markup=None
+                )
+            except Exception as e:
+                logging.error(f"Error updating admin message for {adm_id}: {e}")
+
         await app.send_message(dep_user_id, f"🎉 **Deposit Approved!** ₹{amount:.2f} credited to your wallet.")
+        
+        # Log auto-approval info to log channel
+        log_text = (
+            f"💳 **AUTOMATIC / MANUAL DEPOSIT APPROVED**\n\n"
+            f"👤 **User ID:** `{dep_user_id}`\n"
+            f"💵 **Amount Credited:** ₹{amount:.2f}\n"
+            f"👨‍💻 **Approved By:** {admin_mention}\n"
+            f"📌 **Status:** Wallet Balance Updated"
+        )
+        await log_to_channel(log_text)
 
     elif data.startswith("adm_rej_dep_"):
         if user_id not in SUDO_USERS: return
@@ -1097,7 +1122,7 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         res = await requests_col.find_one_and_update(
             {"_id": ObjectId(req_id), "status": "PENDING"},
-            {"$set": {"status": "REJECTED"}}
+            {"$set": {"status": "REJECTED", "rejected_by": user_id}}
         )
 
         if not res:
@@ -1105,7 +1130,20 @@ async def callback_router(client: Client, query: CallbackQuery):
             return
 
         admin_mention = query.from_user.mention
-        await query.message.edit_caption(caption=query.message.caption + f"\n\n❌ **REJECTED** by {admin_mention}")
+
+        # Synchronize and remove buttons across all admin message entries
+        msg_entries = admin_deposit_msg_map.pop(req_id, [])
+        for adm_id, msg_id in msg_entries:
+            try:
+                await app.edit_message_caption(
+                    chat_id=adm_id,
+                    message_id=msg_id,
+                    caption=query.message.caption + f"\n\n❌ **REJECTED** by {admin_mention}",
+                    reply_markup=None
+                )
+            except Exception as e:
+                logging.error(f"Error updating admin message for {adm_id}: {e}")
+
         await app.send_message(dep_user_id, "❌ Your deposit request was rejected by Admin.")
 
     elif data.startswith("own_app_wth_"):
@@ -1126,7 +1164,7 @@ async def callback_router(client: Client, query: CallbackQuery):
             return
 
         owner_mention = query.from_user.mention
-        await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **WITHDRAWAL SENT & APPROVED** by {owner_mention}")
+        await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **WITHDRAWAL SENT & APPROVED** by {owner_mention}", reply_markup=None)
         await app.send_message(wth_user_id, f"🎉 **Withdrawal Approved!** ₹{amount:.2f} has been sent to your QR account.")
 
 # ==================== PHOTO RECEIVER ====================
@@ -1222,6 +1260,16 @@ async def text_router(client: Client, message: Message):
                 f"🎉 **PAYMENT RECEIVED & VERIFIED!**\n\n"
                 f"✅ Credited **₹{expected_amount:.2f}** to your wallet balance."
             )
+
+            # Auto log message to log channel / group chat
+            log_text = (
+                f"⚡ **AUTO DEPOSIT SUCCESSFUL (UPI / INR)**\n\n"
+                f"👤 **User ID:** `{user_id}`\n"
+                f"💵 **Amount:** ₹{expected_amount:.2f}\n"
+                f"🧾 **Txn ID:** `{txn_id}`\n\n"
+                f"📌 **Status:** Automatically Credited & Approved"
+            )
+            await log_to_channel(log_text)
         else:
             await message.reply_text(
                 "❌ **Payment verification failed!** Fake or invalid transaction ID. Please check and click 'Check Payment' again."
@@ -1241,7 +1289,7 @@ async def text_router(client: Client, message: Message):
             await app.send_photo(
                 chat_id=user_id,
                 photo=qr_image,
-                caption=f"💳 **Send ₹{amount:.2f} to UPI ID:** `{UPI_ID_TEXT}`\n\nSend payment screenshot here."
+                caption=f"💳 **Send ₹{amount:.2f} via UPI / INR to ID:** `{UPI_ID_TEXT}`\n\nSend payment screenshot here."
             )
         except ValueError:
             await message.reply_text("❌ Invalid input!")
@@ -1266,12 +1314,12 @@ async def text_router(client: Client, message: Message):
             qr_image = generate_upi_qr(UPI_ID_TEXT, PAYEE_NAME, amount)
 
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Check Payment", callback_data=f"auto_check_pay_{pay_id}")],
+                [InlineKeyboardButton("🔄 Check Payment (UPI / INR)", callback_data=f"auto_check_pay_{pay_id}")],
                 [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]
             ])
 
             caption = (
-                f"💳 **Pay ₹{amount:.2f} using QR code above**\n\n"
+                f"💳 **Pay ₹{amount:.2f} using QR code above (UPI / INR)**\n\n"
                 f"📌 **UPI ID:** `{UPI_ID_TEXT}`\n\n"
                 f"After paying, press the **Check Payment** button below to complete verification."
             )
@@ -1312,9 +1360,11 @@ async def text_router(client: Client, message: Message):
             f"🧾 **Transaction ID / UTR:** `{txn_id}`"
         )
 
+        admin_deposit_msg_map[req_id] = []
         for sudo_id in SUDO_USERS:
             try:
-                await app.send_photo(chat_id=sudo_id, photo=photo_id, caption=deposit_caption, reply_markup=kb)
+                sent_msg = await app.send_photo(chat_id=sudo_id, photo=photo_id, caption=deposit_caption, reply_markup=kb)
+                admin_deposit_msg_map[req_id].append((sudo_id, sent_msg.id))
             except Exception as e:
                 logging.error(f"Failed sending DM to Admin {sudo_id}: {e}")
 
