@@ -76,7 +76,8 @@ logging.basicConfig(level=logging.INFO)
 
 # ==================== MONGO DB INITIALIZATION ====================
 mongo_client = AsyncIOMotorClient(MONGO_URI)
-db = mongo_client["swasti_shop_db"]
+db = mongo_client["swastik_shop_db"]
+
 
 users_col = db["users"]
 accounts_col = db["accounts"]
