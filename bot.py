@@ -1209,6 +1209,7 @@ async def callback_router(client: Client, query: CallbackQuery):
     elif data == "admin_remove_stock":
         if user_id not in SUDO_USERS: return
 
+        # Pipeline updated to pick a sample _id from the grouped stock
         pipeline = [
             {"$match": {"status": "AVAILABLE"}},
             {"$group": {
@@ -1218,6 +1219,7 @@ async def callback_router(client: Client, query: CallbackQuery):
                     "year": "$year",
                     "price": "$price"
                 },
+                "sample_id": {"$first": "$_id"},
                 "count": {"$sum": 1}
             }}
         ]
@@ -1230,6 +1232,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         buttons = []
         for s in stocks:
             info = s["_id"]
+            sample_id = str(s["sample_id"])
             cat = info.get("category", "General")
             country = info["country"]
             year = info["year"]
@@ -1238,23 +1241,32 @@ async def callback_router(client: Client, query: CallbackQuery):
             flag = get_flag(country)
 
             btn_label = f"🗑️ Delete [{cat}] {flag} {country} ({year}) | ₹{price} | Stock: {count}"
-            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"adm_rmstock_confirm_{cat}_{country}_{year}_{price}")])
+            # Cleaned callback_data using ObjectId to guarantee <64 bytes and fix split errors
+            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"adm_rmstk_{sample_id}")])
 
         buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
         await query.message.edit_text("🗑️ **Select Stock Item to Remove/Delete:**", reply_markup=InlineKeyboardMarkup(buttons))
 
-    elif data.startswith("adm_rmstock_confirm_"):
+    elif data.startswith("adm_rmstk_"):
         if user_id not in SUDO_USERS: return
-        parts = data.split("_")
-        cat, country, year, price = parts[3], parts[4], parts[5], float(parts[6])
+        sample_id = data.split("_")[2]
 
-        res = await accounts_col.delete_many(
-            {"category": cat, "country": country, "year": year, "price": price, "status": "AVAILABLE"}
-        )
+        # Fetch sample item details using sample_id to perform accurate bulk deletion
+        sample_doc = await accounts_col.find_one({"_id": ObjectId(sample_id)})
+        if not sample_doc:
+            await query.answer("❌ Stock item not found or already deleted!", show_alert=True)
+            return
+
+        res = await accounts_col.delete_many({
+            "category": sample_doc.get("category"),
+            "country": sample_doc.get("country"),
+            "year": sample_doc.get("year"),
+            "price": sample_doc.get("price"),
+            "status": "AVAILABLE"
+        })
 
         await query.answer(f"✅ Removed {res.deleted_count} items from stock!", show_alert=True)
         await query.message.edit_text("✅ **Stock removed successfully!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]]))
-
     elif data == "admin_change_price":
         if user_id != OWNER_ID:
             await query.answer("🚫 Only Owner can change stock prices!", show_alert=True)
