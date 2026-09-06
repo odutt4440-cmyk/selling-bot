@@ -720,11 +720,13 @@ async def callback_router(client: Client, query: CallbackQuery):
             [InlineKeyboardButton("🔙 Back to Deposit Options", callback_data="user_deposit_mode_choice")]
         ]
         await query.message.edit_text(
-            "🟡 **USDT / CRYPTO DEPOSIT (BINANCE)**\n\n"
-            "To deposit using USDT / Crypto:\n\n"
-            f"📌 **Binance ID / Pay Address:** `{BINANCE_ID}`\n"
-            "▫️ **Network:** BEP20 / TRC20 / Binance Pay ID\n\n"
-            "After sending crypto, please send the TxHash / Proof to Support for manual balance update.",
+            f"🟡 **USDT / CRYPTO DEPOSIT (BINANCE PAY)**\n\n"
+            f"Send USDT using **Binance Pay** (internal transfer):\n\n"
+            f"📌 **Binance Pay UID:** `{BINANCE_ID}`\n\n"
+            f"▫️ Open Binance → **Pay → Send**\n"
+            f"▫️ Enter UID **{BINANCE_ID}**\n"
+            f"▫️ No network needed (app to app)\n\n"
+            f"After sending, send your **TxHash + Amount** to Support for manual credit.",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
