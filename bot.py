@@ -215,7 +215,7 @@ async def log_to_channel(text: str, reply_markup=None):
 
 def get_buy_now_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛒 Buy Now", url="https://t.me/swastiktgs_bot")]
+        [InlineKeyboardButton("🛒 Buy Now", url="https://t.me/STORE_DET_BOT")]
     ])
 
 def generate_upi_qr(upi_id: str, name: str, amount: float = None) -> io.BytesIO:
@@ -951,6 +951,23 @@ async def callback_router(client: Client, query: CallbackQuery):
         cashback = acc.get("cashback", 0.0)
 
         flag = get_flag(c_name)
+
+        # ---- GC / LOG CHANNEL: NEW NUMBER PURCHASED (masked number) ----
+        try:
+            purchased_log = (
+                f"🛒 **NEW NUMBER PURCHASED!**\n\n"
+                f"👤 **Buyer ID:** `{user_id}`\n"
+                f"📁 **Category:** {cat}\n"
+                f"{flag} **Country & Year:** {c_name} ({year})\n"
+                f"📞 **Phone Number:** `{mask_phone_number(phone)}`\n"
+                f"💵 **Price:** ₹{price:.2f}\n"
+                f"🎁 **Cashback on this Account:** ₹{cashback:.2f}\n\n"
+                f"📌 **Status:** Purchase Successful"
+            )
+            await log_to_channel(purchased_log, reply_markup=get_buy_now_keyboard())
+        except Exception as e:
+            logging.error(f"purchase log error: {e}")
+
         msg = f"⚡ **OTP Live Monitoring Started!**\n\n" \
               f"{flag} **Country:** {c_name.capitalize()} ({year})\n" \
               f"📞 **Phone:** `{phone}`\n" \
@@ -1810,7 +1827,7 @@ async def text_router(client: Client, message: Message):
                 history_text = "\n\n📦 **Purchased Accounts History:**\n"
                 for idx, acc in enumerate(purchased_accs, 1):
                     flag = get_flag(acc.get('country', ''))
-                    history_text += f"{idx}. `{acc.get('phone_number')}` | {acc.get('category')} ({flag} {acc.get('country')} {acc.get('year')}) | ₹{acc.get('price', 0.0):.2f}\n"
+                    history_text += f"{idx}. `{mask_phone_number(acc.get('phone_number', ''))}` | {acc.get('category')} ({flag} {acc.get('country')} {acc.get('year')}) | ₹{acc.get('price', 0.0):.2f}\n"
             else:
                 history_text = "\n\n📦 **Purchased Accounts History:** No accounts purchased yet."
 
