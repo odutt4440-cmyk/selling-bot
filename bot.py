@@ -164,6 +164,7 @@ async def get_user_data(user_id: int):
             "user_id": user_id,
             "balance": 0.0,
             "profile_cashback": 0.0,
+            "withdraw_cashback": 0.0,
             "is_banned": False,
             "ban_reason": ""
         }
@@ -173,6 +174,10 @@ async def get_user_data(user_id: int):
 async def get_user_balance(user_id: int) -> float:
     user = await get_user_data(user_id)
     return user.get("balance", 0.0)
+
+async def get_withdraw_cashback(user_id: int) -> float:
+    user = await get_user_data(user_id)
+    return user.get("withdraw_cashback", 0.0)
 
 async def is_banned(user_id: int) -> tuple[bool, str]:
     user = await get_user_data(user_id)
@@ -186,6 +191,9 @@ async def update_balance(user_id: int, amount: float):
 
 async def update_profile_cashback(user_id: int, amount: float):
     await users_col.update_one({"user_id": user_id}, {"$inc": {"profile_cashback": amount}}, upsert=True)
+
+async def update_withdraw_cashback(user_id: int, amount: float):
+    await users_col.update_one({"user_id": user_id}, {"$inc": {"withdraw_cashback": amount}}, upsert=True)
 
 async def add_sudo_user(user_id: int):
     SUDO_USERS.add(user_id)
@@ -336,7 +344,7 @@ def _parse_famapp_receipt(body: str):
 
 # ==================== EMAIL WATCHER (FAMAPP RECEIPTS → fampay_credits) — THREAD BASED ====================
 _sync_mongo = MongoClient(MONGO_URI)
-_sync_db = _sync_mongo["swasti_shop_db"]
+_sync_db = _sync_mongo["swastik_shop_db"]   # FIXED: was "swasti_shop_db" (wrong DB name)
 _sync_fampay = _sync_db["fampay_credits"]   # same collection, sync access
 
 def _fetch_and_store_fampay_receipts():
@@ -695,7 +703,10 @@ async def callback_router(client: Client, query: CallbackQuery):
             f"👤 **Your Profile**\n\n"
             f"🆔 **ID:** `{user_id}`\n"
             f"💵 **Wallet Balance:** ₹{u_data.get('balance', 0.0):.2f}\n"
-            f"🎁 **Purchasing Profile Cashback:** ₹{u_data.get('profile_cashback', 0.0):.2f}",
+            f"🎁 **Profile Cashback (Locked):** ₹{u_data.get('profile_cashback', 0.0):.2f}\n"
+            f"💸 **Withdrawable Cashback:** ₹{u_data.get('withdraw_cashback', 0.0):.2f}\n\n"
+            f"ℹ️ _Profile Cashback is locked and can NOT be withdrawn or transferred.\n"
+            f"Only Withdrawable Cashback can be withdrawn._",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
         )
 
@@ -947,8 +958,8 @@ async def callback_router(client: Client, query: CallbackQuery):
               f"💵 **Price Paid:** ₹{price:.2f}\n"
 
         if cashback > 0:
-            temp_data[user_id] = {"pending_cashback": cashback, "acc_id": acc_id}
-            msg += f"\n🎁 **Cashback Earned:** ₹{cashback:.2f}!\n"
+            msg += f"\n🎁 **This account has a cashback of:** ₹{cashback:.2f}\n" \
+                   f"_You can claim it after pressing **Finish & Logout Bot**._\n"
 
         msg += "\n_Enter phone number in app. Monitoring OTP..._"
 
@@ -1047,45 +1058,89 @@ async def callback_router(client: Client, query: CallbackQuery):
             except Exception as e:
                 await query.message.reply_text(f"⚠️ Session notice: `{e}`")
 
-        cb_info = temp_data.get(user_id)
-        if cb_info and cb_info.get("pending_cashback", 0) > 0:
-            cb_val = cb_info["pending_cashback"]
+        # ---- CASHBACK OFFER (after logout) ----
+        if acc and float(acc.get("cashback", 0.0) or 0.0) > 0 and not acc.get("cashback_claimed", False):
+            acc_cb = float(acc.get("cashback", 0.0) or 0.0)
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Add to Main Wallet", callback_data=f"cb_claim_wallet_{cb_val}")],
-                [InlineKeyboardButton("👤 Add to Purchasing Profile", callback_data=f"cb_claim_profile_{cb_val}")],
-                [InlineKeyboardButton("🔙 Main Menu", callback_data="user_main_menu")]
+                [InlineKeyboardButton("👤 Add to My Profile", callback_data=f"cbtoprofile_{acc_id}", style=ButtonStyle.PRIMARY)],
+                [InlineKeyboardButton("💸 Add to Withdraw Balance", callback_data=f"cbtowithdraw_{acc_id}", style=ButtonStyle.SUCCESS)]
             ])
             await app.send_message(
                 user_id,
-                f"🎉 **You have earned cashback on your purchase!**\n\n"
-                f"🎁 **Cashback Amount:** ₹{cb_val:.2f}\n"
-                f"Where would you like to add your cashback rewards?",
+                f"🎁 **CASHBACK REWARD!**\n\n"
+                f"The account you purchased has a cashback of **₹{acc_cb:.2f}**.\n\n"
+                f"**Choose where you want to add it:**\n\n"
+                f"👤 **Add to My Profile** — Saved to your Profile Cashback.\n"
+                f"⚠️ _Once added to your Profile, it can **NOT** be transferred to your Withdraw Balance later._\n\n"
+                f"💸 **Add to Withdraw Balance** — Added to your Withdrawable Cashback balance and can be withdrawn.\n\n"
+                f"⚠️ **This is a one-time choice and cannot be changed!**",
                 reply_markup=kb
             )
 
-    elif data.startswith("cb_claim_wallet_"):
-        amount = float(data.split("_")[3])
-        await update_balance(user_id, amount)
-        temp_data.pop(user_id, None)
-        await query.message.edit_text(f"✅ **₹{amount:.2f} Cashback credited to your Main Wallet!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]]))
+    # ==================== CASHBACK CLAIM HANDLERS ====================
+    elif data.startswith("cbtoprofile_") or data.startswith("cbtowithdraw_"):
+        acc_id = data.split("_", 1)[1]
 
-    elif data.startswith("cb_claim_profile_"):
-        amount = float(data.split("_")[3])
-        await update_profile_cashback(user_id, amount)
-        temp_data.pop(user_id, None)
-        await query.message.edit_text(f"✅ **₹{amount:.2f} Cashback saved to your Purchasing Profile!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]]))
+        # Atomic claim — dobara click se double credit nahi hoga
+        acc_doc = await accounts_col.find_one_and_update(
+            {"_id": ObjectId(acc_id), "cashback_claimed": {"$ne": True}},
+            {"$set": {"cashback_claimed": True}}
+        )
+        if not acc_doc:
+            await query.answer("⚠️ Already claimed or invalid!", show_alert=True)
+            return
+
+        amount = float(acc_doc.get("cashback", 0.0) or 0.0)
+
+        if data.startswith("cbtoprofile_"):
+            # Profile cashback = locked, withdraw me use NAHI hoga
+            await update_profile_cashback(user_id, amount)
+            await query.message.edit_text(
+                f"✅ **₹{amount:.2f} Cashback added to your Profile!**\n\n"
+                f"⚠️ **Note:** Profile Cashback is locked and can NOT be transferred "
+                f"to your Withdraw Balance or withdrawn.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
+            )
+            await log_to_channel(
+                f"🎁 **CASHBACK CLAIMED (PROFILE)**\n\n"
+                f"👤 **User ID:** `{user_id}`\n"
+                f"💵 **Amount:** ₹{amount:.2f}\n"
+                f"📌 **Type:** Profile Cashback (Locked)"
+            )
+        else:
+            # Withdrawable cashback balance
+            await update_withdraw_cashback(user_id, amount)
+            await query.message.edit_text(
+                f"✅ **₹{amount:.2f} Cashback added to your Withdraw Balance!**\n\n"
+                f"💸 You can now withdraw it from **Withdraw Cashback** menu.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💸 Withdraw Cashback", callback_data="user_withdraw_menu")],
+                                                    [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
+            )
+            await log_to_channel(
+                f"🎁 **CASHBACK CLAIMED (WITHDRAW)**\n\n"
+                f"👤 **User ID:** `{user_id}`\n"
+                f"💵 **Amount:** ₹{amount:.2f}\n"
+                f"📌 **Type:** Withdrawable Cashback"
+            )
+        await query.answer("✅ Cashback claimed!")
 
     elif data == "user_withdraw_menu":
-        bal = await get_user_balance(user_id)
-        if bal < MIN_WITHDRAW:
-            await query.answer(f"❌ Minimum ₹{MIN_WITHDRAW:.2f} required to withdraw. Your balance: ₹{bal:.2f}", show_alert=True)
+        cb = await get_withdraw_cashback(user_id)
+        if cb < MIN_WITHDRAW:
+            bal = await get_user_balance(user_id)
+            await query.answer(
+                f"❌ Withdrawals are only from CASHBACK balance.\n"
+                f"🎁 Withdrawable Cashback: ₹{cb:.2f} (Min ₹{MIN_WITHDRAW:.2f})\n"
+                f"💰 Wallet Balance (not withdrawable): ₹{bal:.2f}",
+                show_alert=True)
             return
 
         user_states[user_id] = "WAIT_WITHDRAW_AMOUNT"
         await query.message.edit_text(
-            f"💸 **CASHBACK / WALLET WITHDRAWAL**\n\n"
-            f"💰 **Available Balance:** ₹{bal:.2f}\n"
+            f"💸 **CASHBACK WITHDRAWAL**\n\n"
+            f"🎁 **Withdrawable Cashback:** ₹{cb:.2f}\n"
             f"⚠️ **Minimum Withdrawal:** ₹{MIN_WITHDRAW:.2f}\n\n"
+            f"ℹ️ _Only your **Cashback** can be withdrawn — your deposit/wallet balance can NOT be withdrawn._\n\n"
             f"🔢 **Enter amount to withdraw:**",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
         )
@@ -1164,17 +1219,20 @@ async def callback_router(client: Client, query: CallbackQuery):
         user_cb_pipeline = [
             {"$group": {
                 "_id": None,
-                "total_claimed_cb": {"$sum": "$profile_cashback"}
+                "total_claimed_cb": {"$sum": "$profile_cashback"},
+                "total_withdraw_cb": {"$sum": "$withdraw_cashback"}
             }}
         ]
         user_cb_res = await users_col.aggregate(user_cb_pipeline).to_list(length=1)
         profile_cb_claimed = user_cb_res[0]["total_claimed_cb"] if user_cb_res else 0.0
+        withdraw_cb_total = user_cb_res[0]["total_withdraw_cb"] if user_cb_res else 0.0
 
         stats_text = (
             f"📊 **BOT STATISTICS & REVENUE METRICS**\n\n"
             f"💰 **Total Revenue:** ₹{total_revenue:.2f}\n"
             f"🎁 **Total Cashback Issued:** ₹{total_cashback_issued:.2f}\n"
-            f"👤 **Profile Cashback Claimed:** ₹{profile_cb_claimed:.2f}\n\n"
+            f"👤 **Profile Cashback Claimed:** ₹{profile_cb_claimed:.2f}\n"
+            f"💸 **Withdrawable Cashback Held:** ₹{withdraw_cb_total:.2f}\n\n"
             f"📦 **Available Stock:** {available_stock} accounts\n"
             f"🛍️ **Total Accounts Sold:** {sold_stock} accounts\n\n"
             f"👥 **Total Registered Users:** {total_users}\n"
@@ -1547,7 +1605,8 @@ async def photo_receiver(client: Client, message: Message):
         amount = temp_data[user_id]["withdraw_amount"]
         user_states.pop(user_id, None)
 
-        await update_balance(user_id, -amount)
+        # Withdraw sirf CASHBACK se hoga — deposit/wallet balance involved NAHI hai
+        await update_withdraw_cashback(user_id, -amount)
 
         req_doc = {"type": "WITHDRAW", "status": "PENDING"}
         req_res = await requests_col.insert_one(req_doc)
@@ -1560,9 +1619,10 @@ async def photo_receiver(client: Client, message: Message):
         ])
 
         caption = (
-            f"💸 **NEW WITHDRAWAL REQUEST (OWNER ONLY)**\n\n"
+            f"💸 **NEW CASHBACK WITHDRAWAL REQUEST (OWNER ONLY)**\n\n"
             f"👤 **User:** {message.from_user.mention} (`{user_id}`)\n"
             f"💵 **Amount:** ₹{amount:.2f}\n"
+            f"🎁 **Source:** Cashback Balance\n"
             f"📌 **Status:** Pending payment to QR below."
         )
 
@@ -1762,7 +1822,8 @@ async def text_router(client: Client, message: Message):
                 f"🆔 **User ID:** `{target_id}`\n"
                 f"📌 **Account Status:** {status_ban}{ban_reason}\n"
                 f"💵 **Wallet Balance:** ₹{u_data.get('balance', 0.0):.2f}\n"
-                f"🎁 **Profile Cashback:** ₹{u_data.get('profile_cashback', 0.0):.2f}\n"
+                f"🎁 **Profile Cashback (Locked):** ₹{u_data.get('profile_cashback', 0.0):.2f}\n"
+                f"💸 **Withdrawable Cashback:** ₹{u_data.get('withdraw_cashback', 0.0):.2f}\n"
                 f"🛍️ **Total Accounts Bought:** {len(purchased_accs)}"
                 f"{history_text}"
             )
@@ -1785,14 +1846,21 @@ async def text_router(client: Client, message: Message):
     elif state == "WAIT_WITHDRAW_AMOUNT":
         try:
             amount = float(message.text.strip())
-            bal = await get_user_balance(user_id)
+            cb = await get_withdraw_cashback(user_id)
 
             if amount < MIN_WITHDRAW:
                 await message.reply_text(f"❌ Minimum withdrawal is ₹{MIN_WITHDRAW:.2f}:")
                 return
 
-            if amount > bal:
-                await message.reply_text(f"❌ Insufficient wallet balance! Available: ₹{bal:.2f}:")
+            if amount > cb:
+                bal = await get_user_balance(user_id)
+                await message.reply_text(
+                    f"❌ **Insufficient Cashback Balance!**\n\n"
+                    f"🎁 Available Withdrawable Cashback: **₹{cb:.2f}**\n"
+                    f"💰 Wallet Balance (NOT withdrawable): ₹{bal:.2f}\n\n"
+                    f"ℹ️ _Withdrawals are only allowed from your **Cashback Balance** — "
+                    f"your deposit/wallet balance can NOT be withdrawn._"
+                )
                 return
 
             temp_data[user_id] = {"withdraw_amount": amount}
