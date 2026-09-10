@@ -1622,7 +1622,7 @@ async def photo_receiver(client: Client, message: Message):
         amount = temp_data[user_id]["withdraw_amount"]
         user_states.pop(user_id, None)
 
-        # Withdraw sirf CASHBACK se hoga — deposit/wallet balance involved NAHI hai
+        
         await update_withdraw_cashback(user_id, -amount)
 
         req_doc = {"type": "WITHDRAW", "status": "PENDING"}
@@ -2124,7 +2124,7 @@ async def text_router(client: Client, message: Message):
 
 # ==================== START SERVER ====================
 if __name__ == "__main__":
-    threading.Thread(target=_email_watcher_loop, daemon=True).start()   # email watcher alag thread mein
+    threading.Thread(target=_email_watcher_loop, daemon=True).start()   
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
     print("🚀 Mongo Engine Activated!")
