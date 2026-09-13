@@ -28,7 +28,7 @@ def InlineKeyboardButton(text, style=None, **kwargs):
     """Colored-button wrapper (kurigram ButtonStyle). Auto-picks color from label text."""
     if style is None:
         danger = ("❌", "🚫", "🗑", "delete", "terminate", "logout", "reject", "ban",
-                  "close", "remove", "cancel", "stop", "finish")
+                  "close", "remove", "cancel", "stop", "finish", "deduct")
         success = ("✅", "🟢", "✨", "🛒", "buy", "deposit", "approve", "confirm",
                    "verify", "add", "claim", "unban", "check payment", "send money", "+")
         t = text.lower()
@@ -53,13 +53,16 @@ BINANCE_ID = os.getenv("BINANCE_ID", "0xYourBinanceUSDTAddressHere")
 PAYEE_NAME = os.getenv("PAYEE_NAME", "Account Store")
 PAYMENT_API_KEY = os.getenv("PAYMENT_API_KEY", "")
 
+# --- USDT conversion rate (1 USDT = ? INR) ---
+USDT_INR_RATE = float(os.getenv("USDT_INR_RATE", "90.0"))
+
 # --- Email watcher (FamApp/FamX receipt auto-verification) ---
 IMAP_SERVER = os.getenv("IMAP_SERVER", "imap.gmail.com")
 IMAP_EMAIL = os.getenv("IMAP_EMAIL", "")
 IMAP_PASSWORD = os.getenv("IMAP_PASSWORD", "")      # Gmail App Password
 IMAP_POLL_INTERVAL = int(os.getenv("IMAP_POLL_INTERVAL", "20"))
-# Sirf is sender ke emails scan honge (FamApp receipts)
-FAMPAY_SENDER = os.getenv("FAMPAY_SENDER", "no-reply@famapp.in").strip().lower()
+# Sirf is sender ke emails scan honge (FamApp receipts). Khali chhodo toh sab senders scan honge.
+FAMPAY_SENDER = os.getenv("FAMPAY_SENDER", "").strip().lower()
 
 # --- Force-join gate (required group + channel) ---
 REQ_GC_ID = os.getenv("REQ_GC_ID", "")               # proof group (username ya numeric id)
@@ -71,6 +74,7 @@ REQ_CH_NAME = os.getenv("REQ_CH_NAME", "Store Channel")
 
 MIN_DEPOSIT = 50.0
 MIN_WITHDRAW = 50.0
+MIN_CRYPTO_DEPOSIT = 1.0   # USDT
 
 logging.basicConfig(level=logging.INFO)
 
@@ -116,6 +120,17 @@ def get_flag(country_name: str) -> str:
         return chr(ord(c_clean[0].upper()) + 127397) + chr(ord(c_clean[1].upper()) + 127397)
 
     return "🌐"
+
+def inr_to_usdt(price_inr: float) -> float:
+    """Convert INR price to USDT at current configured rate."""
+    try:
+        return round(float(price_inr) / USDT_INR_RATE, 2)
+    except Exception:
+        return 0.0
+
+def price_label(price_inr: float) -> str:
+    """₹30 / 0.33$ style dual-currency label."""
+    return f"₹{price_inr:.2f}/{inr_to_usdt(price_inr):.2f}$"
 
 async def init_db():
     global SUDO_USERS
@@ -163,6 +178,7 @@ async def get_user_data(user_id: int):
         user = {
             "user_id": user_id,
             "balance": 0.0,
+            "usdt_balance": 0.0,
             "profile_cashback": 0.0,
             "withdraw_cashback": 0.0,
             "is_banned": False,
@@ -174,6 +190,10 @@ async def get_user_data(user_id: int):
 async def get_user_balance(user_id: int) -> float:
     user = await get_user_data(user_id)
     return user.get("balance", 0.0)
+
+async def get_user_usdt_balance(user_id: int) -> float:
+    user = await get_user_data(user_id)
+    return float(user.get("usdt_balance", 0.0))
 
 async def get_withdraw_cashback(user_id: int) -> float:
     user = await get_user_data(user_id)
@@ -188,6 +208,9 @@ async def set_user_balance(user_id: int, new_balance: float):
 
 async def update_balance(user_id: int, amount: float):
     await users_col.update_one({"user_id": user_id}, {"$inc": {"balance": amount}}, upsert=True)
+
+async def update_usdt_balance(user_id: int, amount: float):
+    await users_col.update_one({"user_id": user_id}, {"$inc": {"usdt_balance": amount}}, upsert=True)
 
 async def update_profile_cashback(user_id: int, amount: float):
     await users_col.update_one({"user_id": user_id}, {"$inc": {"profile_cashback": amount}}, upsert=True)
@@ -301,9 +324,9 @@ async def _send_join_gate(chat_id, missing):
     except Exception as e:
         logging.error(f"join gate error: {e}")
 
-# ==================== EMAIL WATCHER (FAMAPP RECEIPTS → fampay_credits) ====================
+# ==================== EMAIL WATCHER (PAYMENT RECEIPTS → fampay_credits) ====================
 def _get_email_body(msg) -> str:
-    """Extract plain-text AND html body from an email (FamApp receipts are often HTML)."""
+    """Extract plain-text AND html body from an email (receipts are often HTML)."""
     body = ""
     for part in msg.walk():
         ctype = part.get_content_type()
@@ -317,38 +340,82 @@ def _get_email_body(msg) -> str:
                 body += chunk + "\n"
     return body
 
+# Incoming-credit keywords (FamApp + dusre apps ke liye broad matching)
+_INCOMING_KEYWORDS = (
+    "successfully received", "money received", "amount received",
+    "has been credited", "credited to your account", "received via",
+    "you have received", "payment received", "credit successful"
+)
+
+# UTR / Ref number patterns — dusre apps (PhonePe, GPay, Paytm, FamApp etc.)
+_UTR_PATTERNS = [
+    r"(?:transaction\s*id|txn\s*id|utr(?:\s*(?:no\.?|number))?|upi\s*(?:ref(?:erence)?)?\s*(?:no\.?|number|id)?|reference\s*(?:no\.?|number|id)?|rrn)\s*[:\-#]?\s*([A-Za-z0-9\/\-]{6,40})",
+    r"(?:upi|txn|transaction)[\/\s][A-Za-z0-9\-]+[\/\s]([A-Za-z0-9\-]{6,40})",   # UPI/xxx/UTR format
+    r"\b(\d{12})\b",                                                              # standard 12-digit UTR
+]
+
 def _parse_famapp_receipt(body: str):
     """
-    Parse a FamApp/FamX receipt.
-    Returns (amount, utr) ONLY for INCOMING money ("successfully received"),
-    else (None, None). "paid" emails are ignored.
+    Parse a payment receipt (FamApp/FamX ya koi bhi UPI app).
+    Returns (amount, utr) ONLY for INCOMING money, else (None, None).
+    'paid' / 'debited' / 'sent' wale emails ignore hote hain.
     """
-    received = re.search(r"successfully\s+received", body, re.IGNORECASE)
-    if not received:
-        return (None, None)          # outgoing 'paid' ya koi aur email -> ignore
+    b = body.lower()
 
-    # Sirf received block ka amount (balance ka ₹ andar nahi aayega)
-    seg_start = received.end()
-    tx = re.search(r"Transaction\s*ID", body, re.IGNORECASE)
-    seg = body[seg_start: tx.start() if tx else len(body)]
+    # Outgoing payments skip karo
+    if re.search(r"\b(paid\s+to|debited|money\s+sent|payment\s+sent|successfully\s+paid)\b", b):
+        return (None, None)
 
-    m_amt = re.search(r"₹\s*([\d,]+(?:\.\d+)?)", seg)
-    amount = float(m_amt.group(1).replace(",", "")) if m_amt else 0.0
+    # Incoming check — koi bhi incoming keyword match ho
+    kw_match = None
+    for kw in _INCOMING_KEYWORDS:
+        m = re.search(re.escape(kw), b)
+        if m:
+            kw_match = m
+            break
+    if not kw_match:
+        # Fallback: 'received' word present + ₹ amount present
+        kw_match = re.search(r"\breceived\b", b)
+        if not kw_match:
+            return (None, None)
 
-    m_utr = re.search(r"Transaction\s*ID\s*:?\s*([A-Za-z0-9]{6,30})", body, re.IGNORECASE)
-    utr = m_utr.group(1) if m_utr else ""
+    # Keyword ke baad ka segment le lo (balance wale ₹ amounts avoid karne ke liye)
+    seg = body[kw_match.end(): kw_match.end() + 400]
+    m_amt = re.search(r"[₹rs\.]?\s*([\d,]+(?:\.\d+)?)", seg, re.IGNORECASE)
+
+    # Fallback: pure body me ₹ amounts, sabse bada wala transaction amount hota hai
+    if not m_amt:
+        all_amts = re.findall(r"₹\s*([\d,]+(?:\.\d+)?)", body)
+        if all_amts:
+            best = max(all_amts, key=lambda x: float(x.replace(",", "")))
+            amount = float(best.replace(",", ""))
+        else:
+            return (None, None)
+    else:
+        amount = float(m_amt.group(1).replace(",", ""))
+
+    # UTR / Ref number nikaalo — multiple formats try karo
+    utr = ""
+    for pat in _UTR_PATTERNS:
+        m = re.search(pat, body, re.IGNORECASE)
+        if m:
+            cand = m.group(1).strip("/-")
+            # Sirf meaningful token lo (pure year/date ho sakti hai toh skip mat karo, 12-digit is valid UTR)
+            if len(cand) >= 6:
+                utr = cand
+                break
 
     if amount <= 0 or not utr:
         return (None, None)
     return (amount, utr)
 
-# ==================== EMAIL WATCHER (FAMAPP RECEIPTS → fampay_credits) — THREAD BASED ====================
+# ==================== EMAIL WATCHER — THREAD BASED ====================
 _sync_mongo = MongoClient(MONGO_URI)
-_sync_db = _sync_mongo["swastik_shop_db"]   # FIXED: was "swasti_shop_db" (wrong DB name)
+_sync_db = _sync_mongo["swastik_shop_db"]
 _sync_fampay = _sync_db["fampay_credits"]   # same collection, sync access
 
 def _fetch_and_store_fampay_receipts():
-    """Sync IMAP poll: sirf FAMPAY_SENDER ke INCOMING receipts store karta hai."""
+    """Sync IMAP poll: incoming payment receipts store karta hai."""
     if not (IMAP_EMAIL and IMAP_PASSWORD):
         return
     try:
@@ -356,7 +423,6 @@ def _fetch_and_store_fampay_receipts():
         conn.login(IMAP_EMAIL, IMAP_PASSWORD)
         conn.select("INBOX")
 
-        # Gmail side par hi sender filter -> spam/newsletter scan hi nahi hoga
         if FAMPAY_SENDER:
             typ, data = conn.search(None, f'(UNSEEN FROM "{FAMPAY_SENDER}")')
         else:
@@ -370,7 +436,6 @@ def _fetch_and_store_fampay_receipts():
                         continue
                     msg = email_module.message_from_bytes(msg_data[0][1])
 
-                    # double-safety sender check
                     if FAMPAY_SENDER and FAMPAY_SENDER not in (msg.get("From") or "").lower():
                         continue
 
@@ -381,14 +446,16 @@ def _fetch_and_store_fampay_receipts():
                         logging.info(f"Skipped (no incoming credit) from {msg.get('From')}")
                         continue    # seen flag mat lagao
 
-                    if not _sync_fampay.find_one({"utr": utr}):
+                    utr_norm = re.sub(r"[^A-Za-z0-9]", "", utr).upper()
+                    if not _sync_fampay.find_one({"$or": [{"utr": utr}, {"utr_norm": utr_norm}]}):
                         _sync_fampay.insert_one({
                             "utr": utr,
+                            "utr_norm": utr_norm,
                             "amount": amount,
                             "sender": msg.get("From", ""),
                             "received_at": time.time(),
                         })
-                        logging.info(f"FamApp credit logged -> UTR={utr} amount=₹{amount}")
+                        logging.info(f"Payment credit logged -> UTR={utr} amount=₹{amount}")
                         conn.store(num, '+FLAGS', '\\Seen')   # sirf valid mile tab seen
                 except Exception as e:
                     logging.error(f"IMAP parse error on msg: {e}")
@@ -406,14 +473,56 @@ def _email_watcher_loop():
 
 # ==================== AUTO PAYMENT VERIFICATION (EMAIL-BACKED) ====================
 async def check_auto_payment_status(txn_id: str, amount: float) -> bool:
-    """FamApp email-backed UTR verification. Only a UTR logged by the email watcher is accepted."""
+    """
+    Email-backed UTR verification (FamApp + dusre apps).
+    Match strategy:
+      1. Exact UTR match (normalized)
+      2. Partial UTR match (user ne full/partial ref diya ho)
+      3. Fallback: same amount + last 24h me received, unused credit
+    """
     if not txn_id:
         return False
-    rec = await fampay_credits_col.find_one({"utr": txn_id, "used": {"$ne": True}})
+
+    txn_norm = re.sub(r"[^A-Za-z0-9]", "", txn_id).upper()
+    if not txn_norm:
+        return False
+
+    rec = None
+
+    # 1. Exact normalized UTR match
+    rec = await fampay_credits_col.find_one({"utr_norm": txn_norm, "used": {"$ne": True}})
+
+    # 2. Partial match (substring dono taraf)
+    if not rec and len(txn_norm) >= 6:
+        rec = await fampay_credits_col.find_one({
+            "utr_norm": {"$regex": re.escape(txn_norm), "$options": "i"},
+            "used": {"$ne": True}
+        })
+    if not rec and len(txn_norm) >= 6:
+        rec = await fampay_credits_col.find_one({
+            "utr": {"$regex": re.escape(txn_id.strip()), "$options": "i"},
+            "used": {"$ne": True}
+        })
+
+    # 3. Fallback — UTR galat/alag hai lekin amount same hai aur credit 24h ke andar aaya
+    if not rec:
+        day_ago = time.time() - 86400
+        cursor = fampay_credits_col.find({
+            "used": {"$ne": True},
+            "amount": {"$gte": amount - 0.01, "$lte": amount + 0.01},
+            "received_at": {"$gte": day_ago}
+        }).sort("received_at", -1).limit(1)
+        recs = await cursor.to_list(length=1)
+        if recs:
+            rec = recs[0]
+
     if not rec:
         return False
+
+    # Amount verify karo (UTR-match pe bhi, safety ke liye)
     if abs(float(rec.get("amount", 0)) - amount) > 0.01:
         return False
+
     await fampay_credits_col.update_one(
         {"_id": rec["_id"]},
         {"$set": {"used": True, "used_at": time.time(), "credited_user": rec.get("_pending_user")}}
@@ -563,7 +672,7 @@ def get_admin_panel_keyboard(user_id: int):
         buttons.append(row_2)
 
     if user_id == OWNER_ID:
-        buttons.append([InlineKeyboardButton("✏️ Edit User Balance", callback_data="admin_edit_bal")])
+        buttons.append([InlineKeyboardButton("➕ Add User Balance", callback_data="admin_edit_bal"), InlineKeyboardButton("➖ Deduct User Balance", callback_data="admin_deduct_bal")])
 
     buttons.append([
         InlineKeyboardButton("📊 Stats & Revenue", callback_data="admin_stats"),
@@ -630,7 +739,8 @@ async def start_handler(client: Client, message: Message):
             return
 
     bal = await get_user_balance(user_id)
-    text = f"👋 **Welcome to the Account Store Bot!**\n\n🆔 **User ID:** `{user_id}`\n💰 **Wallet Balance:** ₹{bal:.2f}"
+    usdt_bal = await get_user_usdt_balance(user_id)
+    text = f"👋 **Welcome to the Account Store Bot!**\n\n🆔 **User ID:** `{user_id}`\n💰 **Wallet Balance:** ₹{bal:.2f}\n🟡 **USDT Balance:** {usdt_bal:.2f}$"
     await message.reply_text(text, reply_markup=get_main_menu_keyboard(user_id))
 
 @app.on_message(filters.command("admin") & filters.private)
@@ -695,14 +805,16 @@ async def callback_router(client: Client, query: CallbackQuery):
         user_states.pop(user_id, None)
         temp_data.pop(user_id, None)
         bal = await get_user_balance(user_id)
-        await query.message.edit_text(f"👋 **Main Menu**\n\n💰 **Balance:** ₹{bal:.2f}", reply_markup=get_main_menu_keyboard(user_id))
+        usdt_bal = await get_user_usdt_balance(user_id)
+        await query.message.edit_text(f"👋 **Main Menu**\n\n💰 **INR Balance:** ₹{bal:.2f}\n🟡 **USDT Balance:** {usdt_bal:.2f}$", reply_markup=get_main_menu_keyboard(user_id))
 
     elif data == "user_profile":
         u_data = await get_user_data(user_id)
         await query.message.edit_text(
             f"👤 **Your Profile**\n\n"
             f"🆔 **ID:** `{user_id}`\n"
-            f"💵 **Wallet Balance:** ₹{u_data.get('balance', 0.0):.2f}\n"
+            f"💵 **Wallet Balance (INR):** ₹{u_data.get('balance', 0.0):.2f}\n"
+            f"🟡 **USDT Balance:** {float(u_data.get('usdt_balance', 0.0)):.2f}$\n"
             f"🎁 **Profile Cashback (Locked):** ₹{u_data.get('profile_cashback', 0.0):.2f}\n"
             f"💸 **Withdrawable Cashback:** ₹{u_data.get('withdraw_cashback', 0.0):.2f}\n\n"
             f"ℹ️ _Profile Cashback is locked and can NOT be withdrawn or transferred.\n"
@@ -722,24 +834,20 @@ async def callback_router(client: Client, query: CallbackQuery):
             "💳 **DEPOSIT MONEY MENU**\n\n"
             "Please select how you would like to deposit funds:\n\n"
             "• **Automatic Payment (UPI / INR):** Instantly verified after checking payment.\n"
-            "• **Crypto Deposit (USDT):** Pay via Binance / USDT Payment Gateways.\n"
+            "• **Crypto Deposit (USDT):** Pay via Binance Pay — credits as **USDT balance** in your profile.\n"
             "• **Manual Payment (UPI / INR):** Proof verified by Admin manually.",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
     elif data == "dep_mode_crypto":
-        buttons = [
-            [InlineKeyboardButton("🔙 Back to Deposit Options", callback_data="user_deposit_mode_choice")]
-        ]
+        user_states[user_id] = "WAIT_CRYPTO_AMOUNT"
         await query.message.edit_text(
-            f"🟡 **USDT / CRYPTO DEPOSIT (BINANCE PAY)**\n\n"
-            f"Send USDT using **Binance Pay** (internal transfer):\n\n"
-            f"📌 **Binance Pay UID:** `{BINANCE_ID}`\n\n"
-            f"▫️ Open Binance → **Pay → Send**\n"
-            f"▫️ Enter UID **{BINANCE_ID}**\n"
-            f"▫️ No network needed (app to app)\n\n"
-            f"After sending, send your **TxHash + Amount** to Support for manual credit.",
-            reply_markup=InlineKeyboardMarkup(buttons)
+            f"🟡 **CRYPTO DEPOSIT (USDT — BINANCE PAY)**\n\n"
+            f"⚠️ **Minimum Deposit:** {MIN_CRYPTO_DEPOSIT:.2f} USDT\n\n"
+            f"1️⃣ Open Binance → **Pay → Send** → Enter UID `{BINANCE_ID}`\n"
+            f"2️⃣ Send the USDT (app to app, no network needed)\n\n"
+            f"🔢 **Now enter the USDT amount you deposited (e.g. `5` or `10.5`):**",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
         )
 
     elif data == "dep_mode_manual":
@@ -816,6 +924,7 @@ async def callback_router(client: Client, query: CallbackQuery):
             return
 
         bal = await get_user_balance(user_id)
+        usdt_bal = await get_user_usdt_balance(user_id)
 
         buttons = []
         for c in countries:
@@ -832,7 +941,8 @@ async def callback_router(client: Client, query: CallbackQuery):
             f"🏪 **Buy Telegram Account**\n\n"
             f"**Click country to view price and stock:**\n"
             f"_____________________________________\n\n"
-            f"✅ **Total balance:** ₹{bal:.2f}\n"
+            f"✅ **INR balance:** ₹{bal:.2f}\n"
+            f"🟡 **USDT balance:** {usdt_bal:.2f}$ (Rate: 1$ = ₹{USDT_INR_RATE:.2f})\n"
             f"✅ **Server:** Server (2)\n"
             f"✅ **Page 1 of 1**"
         )
@@ -866,7 +976,7 @@ async def callback_router(client: Client, query: CallbackQuery):
             price = info["price"]
             count = item["count"]
 
-            btn_text = f"📁 {cat} | Year: {year} | ₹{price:.2f} | Stock: {count}"
+            btn_text = f"📁 {cat} | Year: {year} | {price_label(price)} | Stock: {count}"
             buttons.append([InlineKeyboardButton(btn_text, callback_data=f"sel_item_{c_name}_{cat}_{year}_{price}")])
 
         buttons.append([InlineKeyboardButton("🔙 Back to Countries", callback_data="user_buy_menu")])
@@ -893,8 +1003,8 @@ async def callback_router(client: Client, query: CallbackQuery):
             f"{flag} **{c_name.upper()} - ACCOUNT CONFIRMATION**\n\n"
             f"📁 **Category:** {cat}\n"
             f"📅 **Creation Year:** {year}\n"
-            f"💵 **Price:** ₹{price:.2f}\n"
-            f"💰 **Your Balance:** ₹{bal:.2f}\n\n"
+            f"💵 **Price:** {price_label(price)}\n"
+            f"💰 **Your INR Balance:** ₹{bal:.2f}\n\n"
             f"Click Confirm below to complete purchase.",
             reply_markup=kb
         )
@@ -917,8 +1027,8 @@ async def callback_router(client: Client, query: CallbackQuery):
             f"{flag} **FINAL PURCHASE CONFIRMATION**\n\n"
             f"📁 **Category:** {cat}\n"
             f"{flag} **Country / Year:** {c_name} ({year})\n"
-            f"💵 **Price:** ₹{price:.2f}\n"
-            f"💰 **Your Balance:** ₹{bal:.2f}\n\n"
+            f"💵 **Price:** {price_label(price)}\n"
+            f"💰 **Your INR Balance:** ₹{bal:.2f}\n\n"
             f"⚠️ **₹{price:.2f} will be deducted from your wallet.**\n"
             f"Are you sure you want to purchase?",
             reply_markup=kb
@@ -960,7 +1070,7 @@ async def callback_router(client: Client, query: CallbackQuery):
                 f"📁 **Category:** {cat}\n"
                 f"{flag} **Country & Year:** {c_name} ({year})\n"
                 f"📞 **Phone Number:** `{mask_phone_number(phone)}`\n"
-                f"💵 **Price:** ₹{price:.2f}\n"
+                f"💵 **Price:** {price_label(price)}\n"
                 f"🎁 **Cashback on this Account:** ₹{cashback:.2f}\n\n"
                 f"📌 **Status:** Purchase Successful"
             )
@@ -972,7 +1082,7 @@ async def callback_router(client: Client, query: CallbackQuery):
               f"{flag} **Country:** {c_name.capitalize()} ({year})\n" \
               f"📞 **Phone:** `{phone}`\n" \
               f"🔑 **2FA Password:** `{two_fa}`\n" \
-              f"💵 **Price Paid:** ₹{price:.2f}\n"
+              f"💵 **Price Paid:** {price_label(price)}\n"
 
         if cashback > 0:
             msg += f"\n🎁 **This account has a cashback of:** ₹{cashback:.2f}\n" \
@@ -1237,19 +1347,22 @@ async def callback_router(client: Client, query: CallbackQuery):
             {"$group": {
                 "_id": None,
                 "total_claimed_cb": {"$sum": "$profile_cashback"},
-                "total_withdraw_cb": {"$sum": "$withdraw_cashback"}
+                "total_withdraw_cb": {"$sum": "$withdraw_cashback"},
+                "total_usdt": {"$sum": "$usdt_balance"}
             }}
         ]
         user_cb_res = await users_col.aggregate(user_cb_pipeline).to_list(length=1)
         profile_cb_claimed = user_cb_res[0]["total_claimed_cb"] if user_cb_res else 0.0
         withdraw_cb_total = user_cb_res[0]["total_withdraw_cb"] if user_cb_res else 0.0
+        total_usdt_held = float(user_cb_res[0]["total_usdt"] if user_cb_res else 0.0)
 
         stats_text = (
             f"📊 **BOT STATISTICS & REVENUE METRICS**\n\n"
             f"💰 **Total Revenue:** ₹{total_revenue:.2f}\n"
             f"🎁 **Total Cashback Issued:** ₹{total_cashback_issued:.2f}\n"
             f"👤 **Profile Cashback Claimed:** ₹{profile_cb_claimed:.2f}\n"
-            f"💸 **Withdrawable Cashback Held:** ₹{withdraw_cb_total:.2f}\n\n"
+            f"💸 **Withdrawable Cashback Held:** ₹{withdraw_cb_total:.2f}\n"
+            f"🟡 **Total USDT Held by Users:** {total_usdt_held:.2f}$\n\n"
             f"📦 **Available Stock:** {available_stock} accounts\n"
             f"🛍️ **Total Accounts Sold:** {sold_stock} accounts\n\n"
             f"👥 **Total Registered Users:** {total_users}\n"
@@ -1284,7 +1397,6 @@ async def callback_router(client: Client, query: CallbackQuery):
     elif data == "admin_remove_stock":
         if user_id not in SUDO_USERS: return
 
-        # Pipeline updated to pick a sample _id from the grouped stock
         pipeline = [
             {"$match": {"status": "AVAILABLE"}},
             {"$group": {
@@ -1315,8 +1427,7 @@ async def callback_router(client: Client, query: CallbackQuery):
             count = s["count"]
             flag = get_flag(country)
 
-            btn_label = f"🗑️ Delete [{cat}] {flag} {country} ({year}) | ₹{price} | Stock: {count}"
-            # Cleaned callback_data using ObjectId to guarantee <64 bytes and fix split errors
+            btn_label = f"🗑️ Delete [{cat}] {flag} {country} ({year}) | {price_label(price)} | Stock: {count}"
             buttons.append([InlineKeyboardButton(btn_label, callback_data=f"adm_rmstk_{sample_id}")])
 
         buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
@@ -1326,7 +1437,6 @@ async def callback_router(client: Client, query: CallbackQuery):
         if user_id not in SUDO_USERS: return
         sample_id = data.split("_")[2]
 
-        # Fetch sample item details using sample_id to perform accurate bulk deletion
         sample_doc = await accounts_col.find_one({"_id": ObjectId(sample_id)})
         if not sample_doc:
             await query.answer("❌ Stock item not found or already deleted!", show_alert=True)
@@ -1376,7 +1486,7 @@ async def callback_router(client: Client, query: CallbackQuery):
             count = s["count"]
             flag = get_flag(country)
 
-            btn_label = f"📁 [{cat}] {flag} {country} ({year}) - Current: ₹{price} | Stock: {count}"
+            btn_label = f"📁 [{cat}] {flag} {country} ({year}) - Current: {price_label(price)} | Stock: {count}"
             buttons.append([InlineKeyboardButton(btn_label, callback_data=f"adm_chgprice_sel_{cat}_{country}_{year}")])
 
         buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
@@ -1404,7 +1514,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         ])
         await query.message.edit_text(
             f"🛠️ **EDIT STOCK: {cat} ({flag} {country} {year})**\n\n"
-            f"💰 **Current Price:** ₹{cur_price:.2f}\n"
+            f"💰 **Current Price:** {price_label(cur_price)}\n"
             f"🎁 **Current Cashback:** ₹{cur_cb:.2f}\n\n"
             f"What do you want to change?",
             reply_markup=kb
@@ -1436,9 +1546,22 @@ async def callback_router(client: Client, query: CallbackQuery):
             return
         user_states[user_id] = "ADM_STEP_EDIT_BAL"
         await query.message.edit_text(
-            "✏️ **ADD USER BALANCE**\n\n"
+            "➕ **ADD USER BALANCE (INR)**\n\n"
             "Send User ID and Balance to Add separated by space.\n"
             "Format: `UserID BalanceToAdd`\n"
+            "Example: `123456789 5`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+        )
+
+    elif data == "admin_deduct_bal":
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Only Owner can deduct balance!", show_alert=True)
+            return
+        user_states[user_id] = "ADM_STEP_DEDUCT_BAL"
+        await query.message.edit_text(
+            "➖ **DEDUCT USER BALANCE (INR)**\n\n"
+            "Send User ID and Balance to Deduct separated by space.\n"
+            "Format: `UserID BalanceToDeduct`\n"
             "Example: `123456789 5`",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
         )
@@ -1519,7 +1642,6 @@ async def callback_router(client: Client, query: CallbackQuery):
         await update_balance(dep_user_id, amount)
         admin_mention = query.from_user.mention
 
-        # Synchronize and update across all admin message entries
         msg_entries = admin_deposit_msg_map.pop(req_id, [])
         for adm_id, msg_id in msg_entries:
             try:
@@ -1534,7 +1656,6 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         await app.send_message(dep_user_id, f"🎉 **Deposit Approved!** ₹{amount:.2f} credited to your wallet.")
 
-        # Log auto-approval info to log channel
         log_text = (
             f"💳 **AUTOMATIC / MANUAL DEPOSIT APPROVED**\n\n"
             f"👤 **User ID:** `{dep_user_id}`\n"
@@ -1543,6 +1664,65 @@ async def callback_router(client: Client, query: CallbackQuery):
             f"📌 **Status:** Wallet Balance Updated"
         )
         await log_to_channel(log_text)
+
+    # ---- CRYPTO (USDT) DEPOSIT APPROVAL ----
+    elif data.startswith("adm_app_dep_usdt_"):
+        if user_id not in SUDO_USERS: return
+        parts = data.split("_")
+        dep_user_id, amount_usdt, req_id = int(parts[4]), float(parts[5]), parts[6]
+
+        res = await requests_col.find_one_and_update(
+            {"_id": ObjectId(req_id), "status": "PENDING"},
+            {"$set": {"status": "APPROVED", "approved_by": user_id}}
+        )
+
+        if not res:
+            await query.answer("⚠️ Already processed by another admin!", show_alert=True)
+            return
+
+        await update_usdt_balance(dep_user_id, amount_usdt)
+        admin_mention = query.from_user.mention
+
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+            await query.message.edit_text(
+                query.message.text + f"\n\n✅ **APPROVED (+{amount_usdt:.2f} USDT)** by {admin_mention}"
+            )
+        except Exception:
+            pass
+
+        await app.send_message(dep_user_id, f"🎉 **Crypto Deposit Approved!** {amount_usdt:.2f} USDT credited to your USDT balance.")
+
+        log_text = (
+            f"🟡 **CRYPTO (USDT) DEPOSIT APPROVED**\n\n"
+            f"👤 **User ID:** `{dep_user_id}`\n"
+            f"💵 **Amount Credited:** {amount_usdt:.2f} USDT\n"
+            f"👨‍💻 **Approved By:** {admin_mention}\n"
+            f"📌 **Status:** USDT Balance Updated"
+        )
+        await log_to_channel(log_text)
+
+    elif data.startswith("adm_rej_dep_usdt_"):
+        if user_id not in SUDO_USERS: return
+        parts = data.split("_")
+        dep_user_id, req_id = int(parts[4]), parts[5]
+
+        res = await requests_col.find_one_and_update(
+            {"_id": ObjectId(req_id), "status": "PENDING"},
+            {"$set": {"status": "REJECTED", "rejected_by": user_id}}
+        )
+
+        if not res:
+            await query.answer("⚠️ Already processed!", show_alert=True)
+            return
+
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+            await query.message.edit_text(query.message.text + f"\n\n❌ **REJECTED** by {query.from_user.mention}")
+        except Exception:
+            pass
+
+        await app.send_message(dep_user_id, "❌ Your crypto deposit request was rejected by Admin.")
 
     elif data.startswith("adm_rej_dep_"):
         if user_id not in SUDO_USERS: return
@@ -1560,7 +1740,6 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         admin_mention = query.from_user.mention
 
-        # Synchronize and remove buttons across all admin message entries
         msg_entries = admin_deposit_msg_map.pop(req_id, [])
         for adm_id, msg_id in msg_entries:
             try:
@@ -1617,12 +1796,41 @@ async def photo_receiver(client: Client, message: Message):
         user_states[user_id] = "WAIT_DEPOSIT_TXN_ID_MANUAL"
         await message.reply_text("🧾 **Now enter the Transaction ID / UTR Number:**")
 
+    elif state == "WAIT_CRYPTO_PROOF":
+        amount_usdt = temp_data[user_id]["crypto_amount"]
+        user_states.pop(user_id, None)
+
+        req_doc = {"type": "CRYPTO_DEPOSIT", "status": "PENDING"}
+        req_res = await requests_col.insert_one(req_doc)
+        req_id = str(req_res.inserted_id)
+
+        await message.reply_text("⏳ **Crypto deposit proof submitted! Admins are verifying your payment.**")
+
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"adm_app_dep_usdt_{user_id}_{amount_usdt}_{req_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"adm_rej_dep_usdt_{user_id}_{req_id}")
+            ]
+        ])
+
+        proof_caption = (
+            f"🟡 **NEW CRYPTO (USDT) DEPOSIT REQUEST**\n\n"
+            f"👤 **User:** {message.from_user.mention} (`{user_id}`)\n"
+            f"💵 **Amount:** {amount_usdt:.2f} USDT\n"
+            f"🧾 **Proof attached below.**"
+        )
+
+        for sudo_id in SUDO_USERS:
+            try:
+                await app.send_photo(chat_id=sudo_id, photo=message.photo.file_id, caption=proof_caption, reply_markup=kb)
+            except Exception as e:
+                logging.error(f"Failed sending crypto proof to Admin {sudo_id}: {e}")
+
     elif state == "WAIT_WITHDRAW_QR":
         qr_photo_id = message.photo.file_id
         amount = temp_data[user_id]["withdraw_amount"]
         user_states.pop(user_id, None)
 
-        
         await update_withdraw_cashback(user_id, -amount)
 
         req_doc = {"type": "WITHDRAW", "status": "PENDING"}
@@ -1692,7 +1900,6 @@ async def text_router(client: Client, message: Message):
                 f"✅ Credited **₹{expected_amount:.2f}** to your wallet balance."
             )
 
-            # Auto log message to log channel / group chat
             log_text = (
                 f"⚡ **AUTO DEPOSIT SUCCESSFUL (UPI / INR)**\n\n"
                 f"👤 **User ID:** `{user_id}`\n"
@@ -1711,6 +1918,26 @@ async def text_router(client: Client, message: Message):
                 "send the screenshot — our admin will approve it.",
                 reply_markup=kb,
             )
+
+    elif state == "WAIT_CRYPTO_AMOUNT":
+        try:
+            amount_usdt = float(message.text.strip().replace("$", "").replace("usdt", "").replace("USDT", "").strip())
+            if amount_usdt < MIN_CRYPTO_DEPOSIT:
+                await message.reply_text(f"❌ **Minimum Crypto Deposit is {MIN_CRYPTO_DEPOSIT:.2f} USDT.**")
+                return
+
+            temp_data[user_id] = {"crypto_amount": amount_usdt}
+            user_states[user_id] = "WAIT_CRYPTO_PROOF"
+
+            await message.reply_text(
+                f"🟡 **DEPOSIT DETAILS**\n\n"
+                f"📌 **Binance Pay UID:** `{BINANCE_ID}`\n"
+                f"💵 **Amount:** {amount_usdt:.2f} USDT\n\n"
+                f"Now send the **payment proof** here — screenshot ya TxHash text dono chalega.\n"
+                f"Admin verify karke aapke **USDT balance** me credit karega."
+            )
+        except ValueError:
+            await message.reply_text("❌ Invalid input! Sirf number bhejo (e.g. `5`):")
 
     elif state == "WAIT_DEPOSIT_AMOUNT_MANUAL":
         try:
@@ -1827,7 +2054,7 @@ async def text_router(client: Client, message: Message):
                 history_text = "\n\n📦 **Purchased Accounts History:**\n"
                 for idx, acc in enumerate(purchased_accs, 1):
                     flag = get_flag(acc.get('country', ''))
-                    history_text += f"{idx}. `{mask_phone_number(acc.get('phone_number', ''))}` | {acc.get('category')} ({flag} {acc.get('country')} {acc.get('year')}) | ₹{acc.get('price', 0.0):.2f}\n"
+                    history_text += f"{idx}. `{mask_phone_number(acc.get('phone_number', ''))}` | {acc.get('category')} ({flag} {acc.get('country')} {acc.get('year')}) | {price_label(acc.get('price', 0.0))}\n"
             else:
                 history_text = "\n\n📦 **Purchased Accounts History:** No accounts purchased yet."
 
@@ -1839,6 +2066,7 @@ async def text_router(client: Client, message: Message):
                 f"🆔 **User ID:** `{target_id}`\n"
                 f"📌 **Account Status:** {status_ban}{ban_reason}\n"
                 f"💵 **Wallet Balance:** ₹{u_data.get('balance', 0.0):.2f}\n"
+                f"🟡 **USDT Balance:** {float(u_data.get('usdt_balance', 0.0)):.2f}$\n"
                 f"🎁 **Profile Cashback (Locked):** ₹{u_data.get('profile_cashback', 0.0):.2f}\n"
                 f"💸 **Withdrawable Cashback:** ₹{u_data.get('withdraw_cashback', 0.0):.2f}\n"
                 f"🛍️ **Total Accounts Bought:** {len(purchased_accs)}"
@@ -1907,7 +2135,7 @@ async def text_router(client: Client, message: Message):
 
             flag = get_flag(country)
             await message.reply_text(
-                f"✅ **Price Updated!**\n\nUpdated price for `{cat}` ({flag} {country} {year}) to **₹{new_price:.2f}**.",
+                f"✅ **Price Updated!**\n\nUpdated price for `{cat}` ({flag} {country} {year}) to **{price_label(new_price)}**.",
                 reply_markup=get_admin_panel_keyboard(user_id)
             )
         except ValueError:
@@ -1961,6 +2189,48 @@ async def text_router(client: Client, message: Message):
                 f"✅ **Balance Added Successfully!**\n\n"
                 f"👤 User ID: `{t_user_id}`\n"
                 f"➕ Added Amount: ₹{add_amount:.2f}\n"
+                f"💰 New Balance: ₹{new_total:.2f}",
+                reply_markup=get_admin_panel_keyboard(user_id)
+            )
+        except ValueError:
+            await message.reply_text("❌ Check your input numbers!")
+
+    elif state == "ADM_STEP_DEDUCT_BAL":
+        if user_id != OWNER_ID:
+            await message.reply_text("🚫 Only Owner can deduct balance!")
+            return
+
+        try:
+            parts = message.text.strip().split()
+            if len(parts) != 2:
+                await message.reply_text("❌ Invalid Format! Use: `UserID BalanceToDeduct`")
+                return
+
+            t_user_id = int(parts[0])
+            deduct_amount = float(parts[1])
+
+            if deduct_amount <= 0:
+                await message.reply_text("❌ Deduct amount must be positive!")
+                return
+
+            current_bal = await get_user_balance(t_user_id)
+            if current_bal < deduct_amount:
+                await message.reply_text(
+                    f"❌ **Insufficient Balance!**\n\n"
+                    f"👤 User ID: `{t_user_id}`\n"
+                    f"💰 Current Balance: ₹{current_bal:.2f}\n"
+                    f"➖ Requested Deduct: ₹{deduct_amount:.2f}"
+                )
+                return
+
+            await update_balance(t_user_id, -deduct_amount)
+            new_total = await get_user_balance(t_user_id)
+
+            user_states.pop(user_id, None)
+            await message.reply_text(
+                f"✅ **Balance Deducted Successfully!**\n\n"
+                f"👤 User ID: `{t_user_id}`\n"
+                f"➖ Deducted Amount: ₹{deduct_amount:.2f}\n"
                 f"💰 New Balance: ₹{new_total:.2f}",
                 reply_markup=get_admin_panel_keyboard(user_id)
             )
