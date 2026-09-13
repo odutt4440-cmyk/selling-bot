@@ -2455,7 +2455,7 @@ async def text_router(client: Client, message: Message):
             await message.reply_text(
                 f"✅ **Account Added to MongoDB Stock!**\n\n"
                 f"📂 **Category:** {data['category']}\n"
-                f"{flag} **Location:** {data['country']} ({data['year'])}\n"
+                f"{flag} **Location:** {data['country']} ({data['year']})\n"
                 f"📞 **Phone:** `{data['phone']}`",
                 reply_markup=get_admin_panel_keyboard(user_id)
             )
