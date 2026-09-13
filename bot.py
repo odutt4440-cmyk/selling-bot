@@ -551,11 +551,27 @@ async def manual_fallback_timeout(user_id: int, pay_id: str, amount: float):
         logging.error(f"manual_fallback_timeout: {e}")
 
 # ==================== OTP LISTENER ENGINE WITH REFUND ====================
+async def _one_time_refund(user_id: int, acc_id: str, price: float) -> bool:
+    """Atomic one-time refund — dobara refund kabhi nahi milega same account pe."""
+    acc = await accounts_col.find_one_and_update(
+        {"_id": ObjectId(acc_id), "refunded": {"$ne": True}},
+        {"$set": {"refunded": True, "status": "EXPIRED"}}
+    )
+    if not acc:
+        return False
+    await update_balance(user_id, price)
+    return True
+
 async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
     acc = await accounts_col.find_one({"_id": ObjectId(acc_id)})
 
     if not acc:
         await app.send_message(user_id, "❌ **Account session record not found!**")
+        return
+
+    # Already refunded pehle hi — koi aur refund nahi
+    if acc.get("refunded"):
+        await app.send_message(user_id, "⚠️ **This purchase was already refunded. No further refund available.**")
         return
 
     phone_number = acc["phone_number"]
@@ -571,12 +587,31 @@ async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
         await t_client.connect()
 
         if not await t_client.is_user_authorized():
-            await update_balance(user_id, price)
-            await accounts_col.update_one({"_id": ObjectId(acc_id)}, {"$set": {"status": "EXPIRED"}})
-            await app.send_message(
-                user_id,
-                f"⚠️ **Session is expired! Money refunded in your profile (₹{price:.2f}).**"
-            )
+            await t_client.disconnect()
+
+            # REFUND SIRF TAB: OTP deliver nahi hua + pehle refund nahi hua
+            if not acc.get("otp_delivered", False):
+                refunded = await _one_time_refund(user_id, acc_id, price)
+                if refunded:
+                    await app.send_message(
+                        user_id,
+                        f"⚠️ **Session is expired and OTP was never delivered! "
+                        f"Money refunded in your profile (₹{price:.2f}).**"
+                    )
+                    await log_to_channel(
+                        f"↩️ **AUTO REFUND (EXPIRED SESSION)**\n\n"
+                        f"👤 **User ID:** `{user_id}`\n"
+                        f"💵 **Refunded:** ₹{price:.2f}\n"
+                        f"📞 **Account:** `{mask_phone_number(phone_number)}`"
+                    )
+            else:
+                # OTP already deliver ho chuka tha — refund nahi, sirf info
+                await app.send_message(
+                    user_id,
+                    f"⚠️ **Session is no longer active for** `{phone_number}`.\n\n"
+                    f"ℹ️ _OTP was already delivered earlier, so no refund is applicable. "
+                    f"Account ki login details aapke paas already hain._"
+                )
             return
 
         latest_otp = None
@@ -588,6 +623,11 @@ async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
         await t_client.disconnect()
 
         if latest_otp:
+            # Mark OTP delivered — iske baad kabhi refund nahi hoga
+            await accounts_col.update_one(
+                {"_id": ObjectId(acc_id), "otp_delivered": {"$ne": True}},
+                {"$set": {"otp_delivered": True}}
+            )
             await app.send_message(
                 user_id,
                 f"📲 **NEW LOGIN OTP RECEIVED!**\n\n"
@@ -619,16 +659,22 @@ async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
 
     except Exception as e:
         logging.error(f"OTP Fetch Error: {e}")
-
+        
 async def listen_for_otp(user_id: int, phone_number: str, session_string: str, two_fa: str, acc_id: str, price: float):
     try:
         t_client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
         await t_client.connect()
 
         if not await t_client.is_user_authorized():
-            await update_balance(user_id, price)
-            await accounts_col.update_one({"_id": ObjectId(acc_id)}, {"$set": {"status": "EXPIRED"}})
-            await app.send_message(user_id, f"⚠️ **Session is expired! Money refunded in your profile (₹{price:.2f}).**")
+            await t_client.disconnect()
+            # One-time refund only if OTP never delivered
+            refunded = await _one_time_refund(user_id, acc_id, price)
+            if refunded:
+                await app.send_message(
+                    user_id,
+                    f"⚠️ **Session is expired! OTP was never delivered — "
+                    f"money refunded in your profile (₹{price:.2f}).**"
+                )
             return
 
         buy_time = time.time()
@@ -1158,11 +1204,26 @@ async def callback_router(client: Client, query: CallbackQuery):
                 await query.message.reply_text(f"⚠️ **Account Session Expired or Closed:** `{acc['phone_number']}`")
                 return
 
+            # FRESH device list fetch karo — stale list ka hash invalid hota hai
+            authorizations = await t_client(GetAuthorizationsRequest())
+            valid_hashes = {a.hash for a in authorizations.authorizations}
+
+            if hash_val not in valid_hashes:
+                await query.message.reply_text(
+                    "⚠️ **This device session is no longer active (already terminated or list changed).**\n\n"
+                    "📱 Please open **Manage Devices** again to get the fresh list.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📱 Manage Devices", callback_data=f"manage_devs_{acc_id}")]
+                    ])
+                )
+                await t_client.disconnect()
+                return
+
             try:
                 await t_client(ResetAuthorizationRequest(hash=hash_val))
                 await query.message.reply_text("✅ **Device session terminated successfully!**")
             except FreshResetAuthorisationForbiddenError:
-                await query.message.reply_text("⚠️ **Telegram Security Restriction:** New sessions cannot terminate other devices within 24 hours.")
+                await query.message.reply_text("⚠️ **Telegram Security Restriction:** New sessions cannot terminate other devices within 24 hours. Try again after 24h.")
             except Exception as err:
                 await query.message.reply_text(f"❌ Failed to terminate device session: `{err}`")
 
@@ -1175,7 +1236,10 @@ async def callback_router(client: Client, query: CallbackQuery):
         acc_id = data.split("_")[2]
         await query.answer("🚪 Logging out bot session...", show_alert=True)
 
-        acc = await accounts_col.find_one({"_id": ObjectId(acc_id)})
+        await accounts_col.update_one(
+                    {"_id": ObjectId(acc_id)},
+                    {"$set": {"otp_delivered": True, "delivered_final": True}}
+                )
         if acc:
             try:
                 t_client = TelegramClient(StringSession(acc["session_string"]), API_ID, API_HASH)
