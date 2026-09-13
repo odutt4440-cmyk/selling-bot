@@ -1236,21 +1236,28 @@ async def callback_router(client: Client, query: CallbackQuery):
         acc_id = data.split("_")[2]
         await query.answer("🚪 Logging out bot session...", show_alert=True)
 
+        # FIX: acc ko pehle DB se fetch karo (pehle define hi nahi ho raha tha)
+        acc = await accounts_col.find_one({"_id": ObjectId(acc_id)})
+
+        if not acc:
+            await query.message.reply_text("❌ **Account session record not found!**")
+            return
+
         await accounts_col.update_one(
                     {"_id": ObjectId(acc_id)},
                     {"$set": {"otp_delivered": True, "delivered_final": True}}
                 )
-        if acc:
-            try:
-                t_client = TelegramClient(StringSession(acc["session_string"]), API_ID, API_HASH)
-                await t_client.connect()
-                await t_client.log_out()
-                await query.message.reply_text("🚪 **Finish & Logout Complete! Bot session deleted.**")
-            except Exception as e:
-                await query.message.reply_text(f"⚠️ Session notice: `{e}`")
+
+        try:
+            t_client = TelegramClient(StringSession(acc["session_string"]), API_ID, API_HASH)
+            await t_client.connect()
+            await t_client.log_out()
+            await query.message.reply_text("🚪 **Finish & Logout Complete! Bot session deleted.**")
+        except Exception as e:
+            await query.message.reply_text(f"⚠️ Session notice: `{e}`")
 
         # ---- CASHBACK OFFER (after logout) ----
-        if acc and float(acc.get("cashback", 0.0) or 0.0) > 0 and not acc.get("cashback_claimed", False):
+        if float(acc.get("cashback", 0.0) or 0.0) > 0 and not acc.get("cashback_claimed", False):
             acc_cb = float(acc.get("cashback", 0.0) or 0.0)
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("👤 Add to My Profile", callback_data=f"cbtoprofile_{acc_id}", style=ButtonStyle.PRIMARY)],
@@ -2448,7 +2455,7 @@ async def text_router(client: Client, message: Message):
             await message.reply_text(
                 f"✅ **Account Added to MongoDB Stock!**\n\n"
                 f"📂 **Category:** {data['category']}\n"
-                f"{flag} **Location:** {data['country']} ({data['year']})\n"
+                f"{flag} **Location:** {data['country']} ({data['year'])}\n"
                 f"📞 **Phone:** `{data['phone']}`",
                 reply_markup=get_admin_panel_keyboard(user_id)
             )
