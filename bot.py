@@ -90,6 +90,7 @@ requests_col = db["requests"]
 settings_col = db["settings"]
 payments_col = db["payments"]
 fampay_credits_col = db["fampay_credits"]   # email watcher yahan {utr, amount} daalta hai
+deposits_col = db["deposits"]               # har successful deposit ka ledger {user_id, amount, currency, type, approved_by, at}
 
 SUDO_USERS = set()
 
@@ -235,6 +236,79 @@ async def log_to_channel(text: str, reply_markup=None):
             await app.send_message(target_chat, text, reply_markup=reply_markup)
         except Exception as e:
             logging.error(f"Log Channel Error: {e}")
+
+# ==================== DEPOSIT LEDGER (INVESTMENT TRACKING) ====================
+async def record_deposit(user_id: int, amount: float, currency: str = "INR",
+                         dep_type: str = "AUTO", approved_by: int = None, note: str = ""):
+    """
+    Har successful credit ka ledger entry.
+      currency: 'INR' ya 'USDT'
+      dep_type: 'AUTO' | 'MANUAL' | 'USDT' | 'ADMIN_CREDIT' | 'REFUND'
+      approved_by: admin/owner ka user_id (jisme admin ne credit kiya)
+    Agar ADMIN_CREDIT ho (koi admin ne khud balance add/deduct-approve kiya) toh OWNER ko alert jayega.
+    """
+    doc = {
+        "user_id": user_id,
+        "amount": float(amount),
+        "currency": currency,
+        "type": dep_type,
+        "approved_by": approved_by,
+        "note": note,
+        "at": time.time(),
+        "date_str": datetime.now().strftime("%d-%m-%Y %H:%M")
+    }
+    try:
+        await deposits_col.insert_one(doc)
+    except Exception as e:
+        logging.error(f"record_deposit error: {e}")
+
+    # OWNER ko khabar — agar kisi ADMIN ne manually user ko credit kiya
+    if dep_type == "ADMIN_CREDIT" and approved_by and approved_by != OWNER_ID:
+        try:
+            await app.send_message(
+                OWNER_ID,
+                f"🚨 **ADMIN CREDIT ALERT**\n\n"
+                f"👤 **User ID:** `{user_id}`\n"
+                f"💵 **Amount:** ₹{float(amount):.2f}\n"
+                f"👨‍💻 **Credited By Admin:** `{approved_by}`\n"
+                f"🕐 **Time:** {doc['date_str']}\n\n"
+                f"ℹ️ _Ek admin ne user ke wallet me manually paisa add kiya hai. "
+                f"Ownership ko iski khabar di ja rahi hai._"
+            )
+        except Exception as e:
+            logging.error(f"owner admin-credit alert error: {e}")
+
+async def get_user_deposit_summary(user_id: int) -> dict:
+    """User ke total investments + purchases ka summary nikalta hai."""
+    inr_pipeline = [
+        {"$match": {"user_id": user_id, "currency": "INR", "amount": {"$gt": 0}}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}}
+    ]
+    usdt_pipeline = [
+        {"$match": {"user_id": user_id, "currency": "USDT", "amount": {"$gt": 0}}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}}
+    ]
+    inr_res = await deposits_col.aggregate(inr_pipeline).to_list(length=1)
+    usdt_res = await deposits_col.aggregate(usdt_pipeline).to_list(length=1)
+
+    recent = await deposits_col.find({"user_id": user_id}).sort("at", -1).to_list(length=5)
+
+    # ---- Purchase tracking (accounts_col se) ----
+    purchased_accs = await accounts_col.find(
+        {"sold_to": user_id, "status": "SOLD"}
+    ).to_list(length=1000)
+    total_spent = sum(float(a.get("price", 0.0) or 0.0) for a in purchased_accs)
+    acc_count = len(purchased_accs)
+
+    return {
+        "total_inr": inr_res[0]["total"] if inr_res else 0.0,
+        "inr_count": inr_res[0]["count"] if inr_res else 0,
+        "total_usdt": usdt_res[0]["total"] if usdt_res else 0.0,
+        "usdt_count": usdt_res[0]["count"] if usdt_res else 0,
+        "recent": recent,
+        "total_spent": total_spent,
+        "acc_count": acc_count
+    }
 
 def get_buy_now_keyboard():
     return InlineKeyboardMarkup([
@@ -659,7 +733,7 @@ async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
 
     except Exception as e:
         logging.error(f"OTP Fetch Error: {e}")
-        
+
 async def listen_for_otp(user_id: int, phone_number: str, session_string: str, two_fa: str, acc_id: str, price: float):
     try:
         t_client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
@@ -856,6 +930,8 @@ async def callback_router(client: Client, query: CallbackQuery):
 
     elif data == "user_profile":
         u_data = await get_user_data(user_id)
+        dep_sum = await get_user_deposit_summary(user_id)
+        remaining = (dep_sum["total_inr"] + dep_sum["total_usdt"] * USDT_INR_RATE) - dep_sum["total_spent"]
         await query.message.edit_text(
             f"👤 **Your Profile**\n\n"
             f"🆔 **ID:** `{user_id}`\n"
@@ -863,6 +939,11 @@ async def callback_router(client: Client, query: CallbackQuery):
             f"🟡 **USDT Balance:** {float(u_data.get('usdt_balance', 0.0)):.2f}$\n"
             f"🎁 **Profile Cashback (Locked):** ₹{u_data.get('profile_cashback', 0.0):.2f}\n"
             f"💸 **Withdrawable Cashback:** ₹{u_data.get('withdraw_cashback', 0.0):.2f}\n\n"
+            f"📈 **TOTAL INVESTED (Deposits):** ₹{dep_sum['total_inr']:.2f} + {dep_sum['total_usdt']:.2f}$ "
+            f"({dep_sum['inr_count']} INR / {dep_sum['usdt_count']} USDT deposits)\n"
+            f"🛍️ **Total Spent on Accounts:** ₹{dep_sum['total_spent']:.2f}\n"
+            f"📦 **Accounts Purchased:** {dep_sum['acc_count']}\n"
+            f"💰 **Remaining (Invested − Spent):** ₹{remaining:.2f}\n\n"
             f"ℹ️ _Profile Cashback is locked and can NOT be withdrawn or transferred.\n"
             f"Only Withdrawable Cashback can be withdrawn._",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
@@ -1236,17 +1317,17 @@ async def callback_router(client: Client, query: CallbackQuery):
         acc_id = data.split("_")[2]
         await query.answer("🚪 Logging out bot session...", show_alert=True)
 
-        # FIX: acc ko pehle DB se fetch karo (pehle define hi nahi ho raha tha)
         acc = await accounts_col.find_one({"_id": ObjectId(acc_id)})
 
         if not acc:
             await query.message.reply_text("❌ **Account session record not found!**")
             return
 
+        # Logout se pehle delivery mark — iske baad refund bilkul nahi hoga
         await accounts_col.update_one(
-                    {"_id": ObjectId(acc_id)},
-                    {"$set": {"otp_delivered": True, "delivered_final": True}}
-                )
+            {"_id": ObjectId(acc_id)},
+            {"$set": {"otp_delivered": True, "delivered_final": True}}
+        )
 
         try:
             t_client = TelegramClient(StringSession(acc["session_string"]), API_ID, API_HASH)
@@ -1427,9 +1508,36 @@ async def callback_router(client: Client, query: CallbackQuery):
         withdraw_cb_total = user_cb_res[0]["total_withdraw_cb"] if user_cb_res else 0.0
         total_usdt_held = float(user_cb_res[0]["total_usdt"] if user_cb_res else 0.0)
 
+        # --- Total deposits (investment) summary ---
+        dep_pipeline = [
+            {"$match": {"currency": "INR", "amount": {"$gt": 0}}},
+            {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}}
+        ]
+        dep_res = await deposits_col.aggregate(dep_pipeline).to_list(length=1)
+        total_deposited = dep_res[0]["total"] if dep_res else 0.0
+        total_dep_count = dep_res[0]["count"] if dep_res else 0
+
+        usdt_dep_pipeline = [
+            {"$match": {"currency": "USDT", "amount": {"$gt": 0}}},
+            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+        ]
+        usdt_dep_res = await deposits_col.aggregate(usdt_dep_pipeline).to_list(length=1)
+        total_usdt_deposited = usdt_dep_res[0]["total"] if usdt_dep_res else 0.0
+
+        admin_credits_pipeline = [
+            {"$match": {"type": "ADMIN_CREDIT", "amount": {"$gt": 0}}},
+            {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}}
+        ]
+        adm_cred_res = await deposits_col.aggregate(admin_credits_pipeline).to_list(length=1)
+        total_admin_credits = adm_cred_res[0]["total"] if adm_cred_res else 0.0
+        total_admin_credit_count = adm_cred_res[0]["count"] if adm_cred_res else 0
+
         stats_text = (
             f"📊 **BOT STATISTICS & REVENUE METRICS**\n\n"
-            f"💰 **Total Revenue:** ₹{total_revenue:.2f}\n"
+            f"💰 **Total Revenue (Sales):** ₹{total_revenue:.2f}\n"
+            f"📥 **Total User Deposits:** ₹{total_deposited:.2f} ({total_dep_count} deposits)\n"
+            f"🟡 **Total USDT Deposited:** {total_usdt_deposited:.2f}$\n"
+            f"👨‍💻 **Admin Manual Credits:** ₹{total_admin_credits:.2f} ({total_admin_credit_count} times)\n"
             f"🎁 **Total Cashback Issued:** ₹{total_cashback_issued:.2f}\n"
             f"👤 **Profile Cashback Claimed:** ₹{profile_cb_claimed:.2f}\n"
             f"💸 **Withdrawable Cashback Held:** ₹{withdraw_cb_total:.2f}\n"
@@ -1711,6 +1819,8 @@ async def callback_router(client: Client, query: CallbackQuery):
             return
 
         await update_balance(dep_user_id, amount)
+        # ---- DEPOSIT LEDGER + OWNER ALERT (admin ne manually credit kiya) ----
+        await record_deposit(dep_user_id, amount, currency="INR", dep_type="MANUAL", approved_by=user_id)
         admin_mention = query.from_user.mention
 
         msg_entries = admin_deposit_msg_map.pop(req_id, [])
@@ -1752,6 +1862,8 @@ async def callback_router(client: Client, query: CallbackQuery):
             return
 
         await update_usdt_balance(dep_user_id, amount_usdt)
+        # ---- DEPOSIT LEDGER + OWNER ALERT ----
+        await record_deposit(dep_user_id, amount_usdt, currency="USDT", dep_type="USDT", approved_by=user_id)
         admin_mention = query.from_user.mention
 
         try:
@@ -1964,6 +2076,8 @@ async def text_router(client: Client, message: Message):
         if is_valid:
             await payments_col.update_one({"_id": ObjectId(pay_id)}, {"$set": {"status": "SUCCESS", "txn_id": txn_id}})
             await update_balance(user_id, expected_amount)
+            # ---- DEPOSIT LEDGER ENTRY (AUTO deposit, admin nahi — owner ko alert nahi) ----
+            await record_deposit(user_id, expected_amount, currency="INR", dep_type="AUTO", approved_by=None, note=f"UTR: {txn_id}")
             user_states.pop(user_id, None)
 
             await message.reply_text(
@@ -2120,6 +2234,9 @@ async def text_router(client: Client, message: Message):
 
             purchased_accs = await accounts_col.find({"sold_to": target_id, "status": "SOLD"}).to_list(length=100)
 
+            # ---- DEPOSIT SUMMARY (Total Investment) ----
+            dep_sum = await get_user_deposit_summary(target_id)
+
             history_text = ""
             if purchased_accs:
                 history_text = "\n\n📦 **Purchased Accounts History:**\n"
@@ -2128,6 +2245,23 @@ async def text_router(client: Client, message: Message):
                     history_text += f"{idx}. `{mask_phone_number(acc.get('phone_number', ''))}` | {acc.get('category')} ({flag} {acc.get('country')} {acc.get('year')}) | {price_label(acc.get('price', 0.0))}\n"
             else:
                 history_text = "\n\n📦 **Purchased Accounts History:** No accounts purchased yet."
+
+            # ---- Recent Deposit History (last 5) ----
+            dep_history_text = ""
+            if dep_sum["recent"]:
+                dep_history_text = "\n\n📥 **Recent Deposit History (Last 5):**\n"
+                for idx, d in enumerate(dep_sum["recent"], 1):
+                    cur_sym = "🟡" if d.get("currency") == "USDT" else "💵"
+                    cur_unit = " USDT" if d.get("currency") == "USDT" else ""
+                    who = d.get("approved_by")
+                    who_text = f" | 👨‍💻 By: `{who}`" if who else ""
+                    dep_history_text += (
+                        f"{idx}. {cur_sym} {d.get('amount', 0):.2f}{cur_unit}"
+                        f" | 📌 {d.get('type', 'N/A')}{who_text}"
+                        f" | 🕐 {d.get('date_str', 'N/A')}\n"
+                    )
+            else:
+                dep_history_text = "\n\n📥 **Recent Deposit History:** No deposits found."
 
             status_ban = "🚫 Banned" if u_data.get("is_banned", False) else "🟢 Active"
             ban_reason = f"\n⚠️ **Ban Reason:** {u_data.get('ban_reason')}" if u_data.get("is_banned", False) else ""
@@ -2139,9 +2273,15 @@ async def text_router(client: Client, message: Message):
                 f"💵 **Wallet Balance:** ₹{u_data.get('balance', 0.0):.2f}\n"
                 f"🟡 **USDT Balance:** {float(u_data.get('usdt_balance', 0.0)):.2f}$\n"
                 f"🎁 **Profile Cashback (Locked):** ₹{u_data.get('profile_cashback', 0.0):.2f}\n"
-                f"💸 **Withdrawable Cashback:** ₹{u_data.get('withdraw_cashback', 0.0):.2f}\n"
-                f"🛍️ **Total Accounts Bought:** {len(purchased_accs)}"
+                f"💸 **Withdrawable Cashback:** ₹{u_data.get('withdraw_cashback', 0.0):.2f}\n\n"
+                f"📈 **TOTAL INVESTED (Deposits):**\n"
+                f"├ 💵 **INR Deposited:** ₹{dep_sum['total_inr']:.2f} ({dep_sum['inr_count']} deposits)\n"
+                f"└ 🟡 **USDT Deposited:** {dep_sum['total_usdt']:.2f}$ ({dep_sum['usdt_count']} deposits)\n\n"
+                f"🛍️ **TOTAL PURCHASE ACTIVITY:**\n"
+                f"├ 💵 **Total Spent:** ₹{dep_sum['total_spent']:.2f}\n"
+                f"└ 📦 **Accounts Bought:** {dep_sum['acc_count']}"
                 f"{history_text}"
+                f"{dep_history_text}"
             )
 
             user_states.pop(user_id, None)
@@ -2253,6 +2393,8 @@ async def text_router(client: Client, message: Message):
             add_amount = float(parts[1])
 
             await update_balance(t_user_id, add_amount)
+            # ---- DEPOSIT LEDGER + OWNER ALERT (owner khud credit kar raha hai, alert khud ko nahi) ----
+            await record_deposit(t_user_id, add_amount, currency="INR", dep_type="ADMIN_CREDIT", approved_by=user_id)
             new_total = await get_user_balance(t_user_id)
 
             user_states.pop(user_id, None)
@@ -2295,6 +2437,8 @@ async def text_router(client: Client, message: Message):
                 return
 
             await update_balance(t_user_id, -deduct_amount)
+            # ---- DEDUCT bhi ledger me negative entry ke saath record hota hai ----
+            await record_deposit(t_user_id, -deduct_amount, currency="INR", dep_type="ADMIN_CREDIT", approved_by=user_id, note="Balance deducted")
             new_total = await get_user_balance(t_user_id)
 
             user_states.pop(user_id, None)
