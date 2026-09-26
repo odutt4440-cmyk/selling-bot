@@ -945,6 +945,7 @@ def get_admin_panel_keyboard(user_id: int):
         buttons.append([InlineKeyboardButton("🧩 Button Maintenance (Owner)", callback_data="admin_btn_maint_panel")])
         # --- Stock Add History (Owner Only) ---
         buttons.append([InlineKeyboardButton("📜 Stock Add History (Owner)", callback_data="adm_stock_history")])
+        buttons.append([InlineKeyboardButton("💰 Payout System (Owner)", callback_data="adm_payout_panel")])
 
     buttons.append([InlineKeyboardButton("🔙 Exit Admin Panel", callback_data="user_main_menu")])
     return InlineKeyboardMarkup(buttons)
@@ -2057,6 +2058,151 @@ async def callback_router(client: Client, query: CallbackQuery):
                 text[:4000] + "\n\n⚠️ _Showing latest 30 records only._", reply_markup=kb)
         else:
             await query.message.edit_text(text, reply_markup=kb)
+
+    elif data == "adm_payout_panel":
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Owner only!", show_alert=True)
+            return
+        pipeline = [
+            {"$match": {"payout_status": {"$ne": "PAID"}}},
+            {"$group": {
+                "_id": "$admin_id",
+                "admin_name": {"$first": "$admin_name"},
+                "count": {"$sum": 1},
+                "total": {"$sum": "$price"}
+            }},
+            {"$sort": {"total": -1}}
+        ]
+        results = await stock_logs_col.aggregate(pipeline).to_list(length=50)
+        if not results:
+            await query.message.edit_text(
+                "✅ **PAYOUT PANEL**\n\n🎉 No pending payouts! All admins settled.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+            )
+            return
+        text = "💰 **PAYOUT PANEL — Current Payout Balances**\n\n"
+        kb = []
+        for r in results:
+            text += f"👨‍💻 `{r['_id']}` ({r.get('admin_name', '?')}) — {r['count']} accs — **₹{r['total']:.2f}**\n"
+            kb.append([InlineKeyboardButton(
+                f"💸 {r.get('admin_name', r['_id'])} — ₹{r['total']:.2f}",
+                callback_data=f"adm_payout_view_{r['_id']}"
+            )])
+        kb.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data.startswith("adm_payout_view_"):
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Owner only!", show_alert=True)
+            return
+        admin_id = int(data.replace("adm_payout_view_", ""))
+        pending = await stock_logs_col.find(
+            {"admin_id": admin_id, "payout_status": {"$ne": "PAID"}}
+        ).sort("_id", -1).to_list(length=100)
+        if not pending:
+            await query.answer("✅ All settled for this admin!", show_alert=True)
+            return
+        total = sum(p.get("price", 0) for p in pending)
+        name = pending[0].get("admin_name", str(admin_id))
+        text = (
+            f"💸 **PENDING RECORDS — {name} (`{admin_id}`)**\n\n"
+            f"💰 **Current Payout Balance: ₹{total:.2f}**\n\n"
+            f"_Tap 💸 Pay on a record after sending payment — balance updates automatically._\n\n"
+        )
+        kb = []
+        for p in pending:
+            text += (
+                f"📞 `{p.get('phone_number', '?')}` | {p.get('category', '?')} | "
+                f"🌍 {p.get('country', '?')} ({p.get('year', '?')}) | {price_label(p.get('price', 0))} | 🕐 {p.get('date_str', '?')}\n"
+            )
+            kb.append([InlineKeyboardButton(
+                f"💸 Pay {price_label(p.get('price', 0))} — {p.get('phone_number', '?')}",
+                callback_data=f"adm_payout_pay_{p['_id']}"
+            )])
+        kb.append([InlineKeyboardButton("🔙 Back to Payout Panel", callback_data="adm_payout_panel")])
+        if len(text) > 4096:
+            text = text[:4090] + "…"
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data.startswith("adm_payout_pay_"):
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Owner only!", show_alert=True)
+            return
+        log_oid = ObjectId(data.replace("adm_payout_pay_", ""))
+        rec = await stock_logs_col.find_one_and_update(
+            {"_id": log_oid, "payout_status": {"$ne": "PAID"}},
+            {"$set": {
+                "payout_status": "PAID",
+                "paid_at": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
+                "paid_amount": 0
+            }}
+        )
+        if not rec:
+            await query.answer("⚠️ Already paid!", show_alert=True)
+            return
+        amt = float(rec.get("price", 0) or 0)
+        await stock_logs_col.update_one({"_id": log_oid}, {"$set": {"paid_amount": amt}})
+
+        remaining_agg = await stock_logs_col.aggregate([
+            {"$match": {"admin_id": rec["admin_id"], "payout_status": {"$ne": "PAID"}}},
+            {"$group": {"_id": None, "total": {"$sum": "$price"}}}
+        ]).to_list(length=1)
+        remaining = remaining_agg[0]["total"] if remaining_agg else 0.0
+
+        try:
+            await app.send_message(
+                rec["admin_id"],
+                f"💸 **PAYOUT SETTLED!**\n\n"
+                f"📞 Account: `{rec.get('phone_number', '?')}`\n"
+                f"💵 Amount Paid: {price_label(amt)}\n"
+                f"💰 Your Remaining Payout Balance: **₹{remaining:.2f}**"
+            )
+        except Exception:
+            pass
+        try:
+            await log_to_channel(
+                f"💸 **PAYOUT PAID**\n\n"
+                f"👨‍💻 Admin: `{rec['admin_id']}`\n"
+                f"📞 `{rec.get('phone_number', '?')}`\n"
+                f"💵 {price_label(amt)}\n"
+                f"💰 Remaining: ₹{remaining:.2f}\n"
+                f"🕐 {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}"
+            )
+        except Exception:
+            pass
+
+        await query.answer(f"✅ Paid {price_label(amt)}! Remaining: ₹{remaining:.2f}", show_alert=True)
+
+        # Refresh detail view live
+        pending = await stock_logs_col.find(
+            {"admin_id": rec["admin_id"], "payout_status": {"$ne": "PAID"}}
+        ).sort("_id", -1).to_list(length=100)
+        if not pending:
+            await query.message.edit_text(
+                f"✅ **All settled for `{rec['admin_id']}`!**\n\n💰 Current Payout Balance: ₹0.00",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Payout Panel", callback_data="adm_payout_panel")]])
+            )
+            return
+        total = sum(p.get("price", 0) for p in pending)
+        name = pending[0].get("admin_name", str(rec["admin_id"]))
+        text = (
+            f"💸 **PENDING RECORDS — {name} (`{rec['admin_id']}`)**\n\n"
+            f"💰 **Current Payout Balance: ₹{total:.2f}**\n\n"
+        )
+        kb = []
+        for p in pending:
+            text += (
+                f"📞 `{p.get('phone_number', '?')}` | {p.get('category', '?')} | "
+                f"🌍 {p.get('country', '?')} ({p.get('year', '?')}) | {price_label(p.get('price', 0))} | 🕐 {p.get('date_str', '?')}\n"
+            )
+            kb.append([InlineKeyboardButton(
+                f"💸 Pay {price_label(p.get('price', 0))} — {p.get('phone_number', '?')}",
+                callback_data=f"adm_payout_pay_{p['_id']}"
+            )])
+        kb.append([InlineKeyboardButton("🔙 Back to Payout Panel", callback_data="adm_payout_panel")])
+        if len(text) > 4096:
+            text = text[:4090] + "…"
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
     elif data.startswith("adm_cat_"):
         if not has_perm(user_id, "add_acc"): return
