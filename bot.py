@@ -61,18 +61,17 @@ IMAP_SERVER = os.getenv("IMAP_SERVER", "imap.gmail.com")
 IMAP_EMAIL = os.getenv("IMAP_EMAIL", "")
 IMAP_PASSWORD = os.getenv("IMAP_PASSWORD", "")      # Gmail App Password
 IMAP_POLL_INTERVAL = int(os.getenv("IMAP_POLL_INTERVAL", "20"))
-# Sirf is sender ke emails scan honge (FamApp receipts). Khali chhodo toh sab senders scan honge.
 FAMPAY_SENDER = os.getenv("FAMPAY_SENDER", "").strip().lower()
 
-# --- Force-join gate (required group + channel) ---
-REQ_GC_ID = os.getenv("REQ_GC_ID", "")               # proof group (username ya numeric id)
+# --- Force-join gate ---
+REQ_GC_ID = os.getenv("REQ_GC_ID", "")
 REQ_GC_LINK = os.getenv("REQ_GC_LINK", "")
 REQ_GC_NAME = os.getenv("REQ_GC_NAME", "Proof Group")
-REQ_CH_ID = os.getenv("REQ_CH_ID", "")               # store/log channel
+REQ_CH_ID = os.getenv("REQ_CH_ID", "")
 REQ_CH_LINK = os.getenv("REQ_CH_LINK", "")
 REQ_CH_NAME = os.getenv("REQ_CH_NAME", "Store Channel")
 
-MIN_DEPOSIT = 50.0
+MIN_DEPOSIT = 30.0
 MIN_WITHDRAW = 50.0
 MIN_CRYPTO_DEPOSIT = 1.0   # USDT
 
@@ -89,10 +88,64 @@ sudo_col = db["sudo_users"]
 requests_col = db["requests"]
 settings_col = db["settings"]
 payments_col = db["payments"]
-fampay_credits_col = db["fampay_credits"]   # email watcher yahan {utr, amount} daalta hai
-deposits_col = db["deposits"]               # har successful deposit ka ledger {user_id, amount, currency, type, approved_by, at}
+fampay_credits_col = db["fampay_credits"]
+deposits_col = db["deposits"]
+admin_perm_col = db["admin_permissions"]
 
 SUDO_USERS = set()
+
+# ==================== ADMIN PERMISSION SYSTEM ====================
+PERMISSION_LIST = [
+    ("add_acc",          "➕ Add Account Stock"),
+    ("remove_stock",     "🗑️ Remove Stock"),
+    ("stats",            "📊 Stats & Revenue"),
+    ("user_history",     "ℹ️ User History & Info"),
+    ("maintenance",      "🛠️ Maintenance Mode"),
+    ("broadcast",        "📢 Broadcast DM"),
+    ("ban",              "🚫 Ban User"),
+    ("unban",            "🟢 Unban User"),
+    ("deposit_approve",  "💳 Deposit Approve / Reject"),
+]
+
+ADMIN_PERMS = {}
+
+
+async def load_admin_perms():
+    global ADMIN_PERMS
+    ADMIN_PERMS = {}
+    async for doc in admin_perm_col.find():
+        ADMIN_PERMS[doc["user_id"]] = set(doc.get("perms", []))
+
+
+def has_perm(user_id: int, perm_key: str) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    return perm_key in ADMIN_PERMS.get(user_id, set())
+
+
+async def set_admin_perms(user_id: int, perms: set):
+    ADMIN_PERMS[user_id] = set(perms)
+    await admin_perm_col.update_one(
+        {"user_id": user_id},
+        {"$set": {"user_id": user_id, "perms": list(perms)}},
+        upsert=True
+    )
+
+
+async def delete_admin_perms(user_id: int):
+    ADMIN_PERMS.pop(user_id, None)
+    await admin_perm_col.delete_one({"user_id": user_id})
+
+
+def build_admin_perm_keyboard(target_id: int, perms_set: set) -> InlineKeyboardMarkup:
+    buttons = []
+    for key, label in PERMISSION_LIST:
+        mark = "✅" if key in perms_set else "❌"
+        buttons.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"adm_perm_toggle_{key}")])
+    buttons.append([InlineKeyboardButton("✅ Save Admin Powers", callback_data=f"adm_perm_save_{target_id}")])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="admin_manage_sudo")])
+    return InlineKeyboardMarkup(buttons)
+
 
 # Flag Mapping Helper
 FLAG_MAP = {
@@ -112,7 +165,6 @@ FLAG_MAP = {
 }
 
 def get_flag(country_name: str) -> str:
-    """Dynamically fetches flag emoji from country name or calculates ISO regional indicator."""
     c_clean = country_name.strip().lower()
     if c_clean in FLAG_MAP:
         return FLAG_MAP[c_clean]
@@ -123,14 +175,12 @@ def get_flag(country_name: str) -> str:
     return "🌐"
 
 def inr_to_usdt(price_inr: float) -> float:
-    """Convert INR price to USDT at current configured rate."""
     try:
         return round(float(price_inr) / USDT_INR_RATE, 2)
     except Exception:
         return 0.0
 
 def price_label(price_inr: float) -> str:
-    """₹30 / 0.33$ style dual-currency label."""
     return f"₹{price_inr:.2f}/{inr_to_usdt(price_inr):.2f}$"
 
 async def init_db():
@@ -139,6 +189,11 @@ async def init_db():
     sudo_docs = await sudo_col.find().to_list(length=1000)
     SUDO_USERS = {doc["user_id"] for doc in sudo_docs}
     SUDO_USERS.add(OWNER_ID)
+
+    await load_admin_perms()
+
+    # --- SECTION 9: per-button maintenance cache load ---
+    await load_button_maintenance()
 
     m_doc = await settings_col.find_one({"key": "maintenance"})
     if not m_doc:
@@ -228,6 +283,8 @@ async def remove_sudo_user(user_id: int):
         return
     SUDO_USERS.discard(user_id)
     await sudo_col.delete_one({"user_id": user_id})
+    ADMIN_PERMS.pop(user_id, None)
+    await admin_perm_col.delete_one({"user_id": user_id})
 
 async def log_to_channel(text: str, reply_markup=None):
     if LOG_CHANNEL_ID:
@@ -237,16 +294,76 @@ async def log_to_channel(text: str, reply_markup=None):
         except Exception as e:
             logging.error(f"Log Channel Error: {e}")
 
-# ==================== DEPOSIT LEDGER (INVESTMENT TRACKING) ====================
+# ==================== SECTION 4: PER-BUTTON MAINTENANCE (OWNER ONLY PANEL) ====================
+BTN_LABELS = {
+    # --- Main Menu buttons ---
+    "user_buy_menu":            "🛒 Buy Account Menu",
+    "user_deposit_mode_choice": "💳 Deposit Money (Menu)",
+    "user_withdraw_menu":       "💸 Withdraw Cashback",
+    "user_profile":             "👤 Profile",
+    # --- Deposit ke 3 sub-buttons ---
+    "dep_mode_auto":            "⚡ Auto Deposit (UPI/INR)",
+    "dep_mode_crypto":          "🟡 Crypto Deposit (USDT)",
+    "dep_mode_manual":          "✍️ Manual Deposit (UPI/INR)",
+    # --- Admin Panel buttons ---
+    "admin_panel":              "⚙️ Admin Panel",
+    "admin_add_acc":            "➕ Add Account Stock",
+    "admin_remove_stock":       "🗑️ Remove Stock",
+    "admin_change_price":       "🏷️ Change Price / Cashback",
+    "admin_edit_bal":           "➕ Add User Balance",
+    "admin_deduct_bal":         "➖ Deduct User Balance",
+    "admin_stats":              "📊 Stats & Revenue",
+    "admin_user_history":       "ℹ️ User History & Info",
+    "admin_maint_panel":        "🛠️ Maintenance Mode",
+    "admin_broadcast":          "📢 Broadcast DM",
+    "admin_ban_user":           "🚫 Ban User",
+    "admin_unban_user":         "🟢 Unban User",
+    "admin_manage_sudo":        "👥 Manage Admins",
+    "admin_btn_maint_panel":    "🧩 Button Maintenance",
+}
+
+MAINT_CACHE = {}   # {btn_key: reason_str}
+
+async def load_button_maintenance():
+    global MAINT_CACHE
+    doc = await settings_col.find_one({"key": "btn_maintenance"})
+    MAINT_CACHE = dict(doc.get("buttons", {})) if doc else {}
+
+def get_btn_maint_reason(key: str):
+    return MAINT_CACHE.get(key)
+
+def get_btn_maint_keyboard() -> InlineKeyboardMarkup:
+    buttons = []
+    for key, label in BTN_LABELS.items():
+        mark = "🚧" if key in MAINT_CACHE else "🟢"
+        buttons.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"mtn_btn_{key}")])
+    buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(buttons)
+
+async def set_btn_maintenance(key: str, on_off: bool, reason: str = ""):
+    if on_off:
+        MAINT_CACHE[key] = reason or "This feature is under maintenance."
+    else:
+        MAINT_CACHE.pop(key, None)
+    await settings_col.update_one(
+        {"key": "btn_maintenance"},
+        {"$set": {"buttons": MAINT_CACHE}},
+        upsert=True
+    )
+
+def check_btn_maintenance(key: str, user_id: int):
+    """Owner/admins bypass. Returns alert text if button is under maintenance, else None."""
+    if user_id == OWNER_ID or user_id in SUDO_USERS:
+        return None
+    if key in MAINT_CACHE:
+        return (f"🚧 **This button is under maintenance!**\n\n"
+                f"📝 **Reason:** {MAINT_CACHE[key]}\n\n"
+                f"_Please try again later._")
+    return None
+
+# ==================== DEPOSIT LEDGER ====================
 async def record_deposit(user_id: int, amount: float, currency: str = "INR",
                          dep_type: str = "AUTO", approved_by: int = None, note: str = ""):
-    """
-    Har successful credit ka ledger entry.
-      currency: 'INR' ya 'USDT'
-      dep_type: 'AUTO' | 'MANUAL' | 'USDT' | 'ADMIN_CREDIT' | 'REFUND'
-      approved_by: admin/owner ka user_id (jisme admin ne credit kiya)
-    Agar ADMIN_CREDIT ho (koi admin ne khud balance add/deduct-approve kiya) toh OWNER ko alert jayega.
-    """
     doc = {
         "user_id": user_id,
         "amount": float(amount),
@@ -262,7 +379,6 @@ async def record_deposit(user_id: int, amount: float, currency: str = "INR",
     except Exception as e:
         logging.error(f"record_deposit error: {e}")
 
-    # OWNER ko khabar — agar kisi ADMIN ne manually user ko credit kiya
     if dep_type == "ADMIN_CREDIT" and approved_by and approved_by != OWNER_ID:
         try:
             await app.send_message(
@@ -272,14 +388,13 @@ async def record_deposit(user_id: int, amount: float, currency: str = "INR",
                 f"💵 **Amount:** ₹{float(amount):.2f}\n"
                 f"👨‍💻 **Credited By Admin:** `{approved_by}`\n"
                 f"🕐 **Time:** {doc['date_str']}\n\n"
-                f"ℹ️ _Ek admin ne user ke wallet me manually paisa add kiya hai. "
-                f"Ownership ko iski khabar di ja rahi hai._"
+                f"ℹ️ _An admin has manually added money to a user's wallet. "
+                f"The Owner is being notified of this action._"
             )
         except Exception as e:
             logging.error(f"owner admin-credit alert error: {e}")
 
 async def get_user_deposit_summary(user_id: int) -> dict:
-    """User ke total investments + purchases ka summary nikalta hai."""
     inr_pipeline = [
         {"$match": {"user_id": user_id, "currency": "INR", "amount": {"$gt": 0}}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}}
@@ -293,7 +408,6 @@ async def get_user_deposit_summary(user_id: int) -> dict:
 
     recent = await deposits_col.find({"user_id": user_id}).sort("at", -1).to_list(length=5)
 
-    # ---- Purchase tracking (accounts_col se) ----
     purchased_accs = await accounts_col.find(
         {"sold_to": user_id, "status": "SOLD"}
     ).to_list(length=1000)
@@ -398,9 +512,8 @@ async def _send_join_gate(chat_id, missing):
     except Exception as e:
         logging.error(f"join gate error: {e}")
 
-# ==================== EMAIL WATCHER (PAYMENT RECEIPTS → fampay_credits) ====================
+# ==================== EMAIL WATCHER ====================
 def _get_email_body(msg) -> str:
-    """Extract plain-text AND html body from an email (receipts are often HTML)."""
     body = ""
     for part in msg.walk():
         ctype = part.get_content_type()
@@ -414,33 +527,29 @@ def _get_email_body(msg) -> str:
                 body += chunk + "\n"
     return body
 
-# Incoming-credit keywords (FamApp + dusre apps ke liye broad matching)
 _INCOMING_KEYWORDS = (
     "successfully received", "money received", "amount received",
     "has been credited", "credited to your account", "received via",
     "you have received", "payment received", "credit successful"
 )
 
-# UTR / Ref number patterns — dusre apps (PhonePe, GPay, Paytm, FamApp etc.)
 _UTR_PATTERNS = [
-    r"(?:transaction\s*id|txn\s*id|utr(?:\s*(?:no\.?|number))?|upi\s*(?:ref(?:erence)?)?\s*(?:no\.?|number|id)?|reference\s*(?:no\.?|number|id)?|rrn)\s*[:\-#]?\s*([A-Za-z0-9\/\-]{6,40})",
-    r"(?:upi|txn|transaction)[\/\s][A-Za-z0-9\-]+[\/\s]([A-Za-z0-9\-]{6,40})",   # UPI/xxx/UTR format
-    r"\b(\d{12})\b",                                                              # standard 12-digit UTR
+    # 1. Explicit "UTR" label — sabse pehle (FamApp: "UTR : 985976266297")
+    r"utr(?:\s*(?:no\.?|number))?\s*[:\-#]?\s*([0-9]{8,20})",
+    # 2. Standalone 12-digit UPI RRN (jo txn-id pattern se pehle match kare)
+    r"\b(\d{12})\b",
+    # 3. Transaction ID (FamPay FMPIB... jaise) — last fallback
+    r"(?:transaction\s*id|txn\s*id)\s*[:\-#]?\s*([A-Za-z0-9\/\-]{6,40})",
+    # 4. UPI reference / RRN generic
+    r"(?:upi\s*(?:ref(?:erence)?)?\s*(?:no\.?|number|id)?|reference\s*(?:no\.?|number|id)?|rrn)\s*[:\-#]?\s*([A-Za-z0-9\/\-]{6,40})",
 ]
 
 def _parse_famapp_receipt(body: str):
-    """
-    Parse a payment receipt (FamApp/FamX ya koi bhi UPI app).
-    Returns (amount, utr) ONLY for INCOMING money, else (None, None).
-    'paid' / 'debited' / 'sent' wale emails ignore hote hain.
-    """
     b = body.lower()
 
-    # Outgoing payments skip karo
     if re.search(r"\b(paid\s+to|debited|money\s+sent|payment\s+sent|successfully\s+paid)\b", b):
         return (None, None)
 
-    # Incoming check — koi bhi incoming keyword match ho
     kw_match = None
     for kw in _INCOMING_KEYWORDS:
         m = re.search(re.escape(kw), b)
@@ -448,16 +557,13 @@ def _parse_famapp_receipt(body: str):
             kw_match = m
             break
     if not kw_match:
-        # Fallback: 'received' word present + ₹ amount present
         kw_match = re.search(r"\breceived\b", b)
         if not kw_match:
             return (None, None)
 
-    # Keyword ke baad ka segment le lo (balance wale ₹ amounts avoid karne ke liye)
     seg = body[kw_match.end(): kw_match.end() + 400]
     m_amt = re.search(r"[₹rs\.]?\s*([\d,]+(?:\.\d+)?)", seg, re.IGNORECASE)
 
-    # Fallback: pure body me ₹ amounts, sabse bada wala transaction amount hota hai
     if not m_amt:
         all_amts = re.findall(r"₹\s*([\d,]+(?:\.\d+)?)", body)
         if all_amts:
@@ -468,13 +574,11 @@ def _parse_famapp_receipt(body: str):
     else:
         amount = float(m_amt.group(1).replace(",", ""))
 
-    # UTR / Ref number nikaalo — multiple formats try karo
     utr = ""
     for pat in _UTR_PATTERNS:
         m = re.search(pat, body, re.IGNORECASE)
         if m:
             cand = m.group(1).strip("/-")
-            # Sirf meaningful token lo (pure year/date ho sakti hai toh skip mat karo, 12-digit is valid UTR)
             if len(cand) >= 6:
                 utr = cand
                 break
@@ -486,10 +590,9 @@ def _parse_famapp_receipt(body: str):
 # ==================== EMAIL WATCHER — THREAD BASED ====================
 _sync_mongo = MongoClient(MONGO_URI)
 _sync_db = _sync_mongo["swastik_shop_db"]
-_sync_fampay = _sync_db["fampay_credits"]   # same collection, sync access
+_sync_fampay = _sync_db["fampay_credits"]
 
 def _fetch_and_store_fampay_receipts():
-    """Sync IMAP poll: incoming payment receipts store karta hai."""
     if not (IMAP_EMAIL and IMAP_PASSWORD):
         return
     try:
@@ -518,7 +621,7 @@ def _fetch_and_store_fampay_receipts():
 
                     if not amount or not utr:
                         logging.info(f"Skipped (no incoming credit) from {msg.get('From')}")
-                        continue    # seen flag mat lagao
+                        continue
 
                     utr_norm = re.sub(r"[^A-Za-z0-9]", "", utr).upper()
                     if not _sync_fampay.find_one({"$or": [{"utr": utr}, {"utr_norm": utr_norm}]}):
@@ -530,7 +633,7 @@ def _fetch_and_store_fampay_receipts():
                             "received_at": time.time(),
                         })
                         logging.info(f"Payment credit logged -> UTR={utr} amount=₹{amount}")
-                        conn.store(num, '+FLAGS', '\\Seen')   # sirf valid mile tab seen
+                        conn.store(num, '+FLAGS', '\\Seen')
                 except Exception as e:
                     logging.error(f"IMAP parse error on msg: {e}")
         conn.logout()
@@ -545,66 +648,91 @@ def _email_watcher_loop():
             logging.error(f"email watcher error: {e}")
         time.sleep(IMAP_POLL_INTERVAL)
 
-# ==================== AUTO PAYMENT VERIFICATION (EMAIL-BACKED) ====================
-async def check_auto_payment_status(txn_id: str, amount: float) -> bool:
+# ==================== SECTION 1: STRICT AUTO PAYMENT VERIFICATION (EMAIL-BACKED) ====================
+async def check_auto_payment_status(pay_id: str, user_utr: str) -> tuple:
     """
-    Email-backed UTR verification (FamApp + dusre apps).
-    Match strategy:
-      1. Exact UTR match (normalized)
-      2. Partial UTR match (user ne full/partial ref diya ho)
-      3. Fallback: same amount + last 24h me received, unused credit
+    STRICT UTR verification (email-backed).
+    - Exact / partial UTR match only. One-time atomic credit (race-safe).
+    - Auto-retry up to 4 attempts (5s gap) in case the receipt email has not
+      reached the inbox / email watcher hasn't polled it yet.
+    Returns (is_valid: bool, msg: str)
     """
-    if not txn_id:
-        return False
+    pay = await payments_col.find_one({"_id": ObjectId(pay_id)})
+    if not pay:
+        return (False, "❌ Payment request expired!")
+    if pay.get("status") == "SUCCESS":
+        return (False, "✅ This payment is already credited!")
 
-    txn_norm = re.sub(r"[^A-Za-z0-9]", "", txn_id).upper()
-    if not txn_norm:
-        return False
+    if not user_utr:
+        return (False, "❌ Please enter a valid UTR / Transaction ID.")
+
+    utr_clean = re.sub(r"\s+", "", user_utr).upper()
+    digits = re.sub(r"\D", "", utr_clean)
+    if len(utr_clean) < 8 and len(digits) < 10:
+        return (False, "❌ Invalid UTR format! Please enter the correct Transaction ID / UTR number.")
 
     rec = None
 
-    # 1. Exact normalized UTR match
-    rec = await fampay_credits_col.find_one({"utr_norm": txn_norm, "used": {"$ne": True}})
+    for attempt in range(4):
+        # 1. EXACT normalized UTR match (primary — safest)
+        rec = await fampay_credits_col.find_one({"utr_norm": utr_clean, "used": {"$ne": True}})
 
-    # 2. Partial match (substring dono taraf)
-    if not rec and len(txn_norm) >= 6:
-        rec = await fampay_credits_col.find_one({
-            "utr_norm": {"$regex": re.escape(txn_norm), "$options": "i"},
-            "used": {"$ne": True}
-        })
-    if not rec and len(txn_norm) >= 6:
-        rec = await fampay_credits_col.find_one({
-            "utr": {"$regex": re.escape(txn_id.strip()), "$options": "i"},
-            "used": {"$ne": True}
-        })
+        # 2. Partial match — user ka UTR DB record ka clear substring ho (min 8 chars)
+        if not rec and len(utr_clean) >= 8:
+            rec = await fampay_credits_col.find_one({
+                "utr_norm": {"$regex": re.escape(utr_clean), "$options": "i"},
+                "used": {"$ne": True}
+            })
+            if rec and abs(float(rec.get("amount", 0)) - pay["amount"]) > 0.01:
+                rec = None
 
-    # 3. Fallback — UTR galat/alag hai lekin amount same hai aur credit 24h ke andar aaya
+        if rec:
+            break
+
+        # Last attempt nahi hai -> wait karo (email watcher ko poll karne ka time do)
+        if attempt < 3:
+            await asyncio.sleep(5)
+            # Fresh re-fetch in case status changed meanwhile
+            pay = await payments_col.find_one({"_id": ObjectId(pay_id)})
+            if not pay:
+                return (False, "❌ Payment request expired!")
+            if pay.get("status") == "SUCCESS":
+                return (False, "✅ This payment is already credited!")
+
     if not rec:
-        day_ago = time.time() - 86400
-        cursor = fampay_credits_col.find({
-            "used": {"$ne": True},
-            "amount": {"$gte": amount - 0.01, "$lte": amount + 0.01},
-            "received_at": {"$gte": day_ago}
-        }).sort("received_at", -1).limit(1)
-        recs = await cursor.to_list(length=1)
-        if recs:
-            rec = recs[0]
+        return (False, "❌ UTR not found in payment records. "
+                       "Please make sure you entered the EXACT UTR from your payment "
+                       "receipt and try again.")
 
-    if not rec:
-        return False
+    # 3. Amount verification — UTR match ke baad bhi amount match zaroori
+    if abs(float(rec.get("amount", 0)) - pay["amount"]) > 0.01:
+        return (False, f"❌ Amount mismatch! Your payment of ₹{float(rec.get('amount', 0)):.2f} "
+                       f"does not match the requested amount ₹{float(pay['amount']):.2f}.")
 
-    # Amount verify karo (UTR-match pe bhi, safety ke liye)
-    if abs(float(rec.get("amount", 0)) - amount) > 0.01:
-        return False
+    # 4. One-time atomic credit — paid flag, race-safe
+    res = await payments_col.update_one(
+        {"_id": pay["_id"], "status": {"$ne": "SUCCESS"}},
+        {"$set": {
+            "status": "SUCCESS",
+            "txn_id": utr_clean,
+            "paid_at": time.time()
+        }}
+    )
+    if res.modified_count == 0:
+        return (False, "⚠️ Payment already credited!")
 
     await fampay_credits_col.update_one(
         {"_id": rec["_id"]},
-        {"$set": {"used": True, "used_at": time.time(), "credited_user": rec.get("_pending_user")}}
+        {"$set": {"used": True, "used_at": time.time(), "credited_user": pay["user_id"]}}
     )
-    return True
+
+    await update_balance(pay["user_id"], pay["amount"])
+    await record_deposit(pay["user_id"], pay["amount"], currency="INR", dep_type="AUTO",
+                         approved_by=None, note=f"UTR: {utr_clean}")
+    return (True, f"✅ Payment verified! ₹{pay['amount']:.2f} credited to your wallet.")
+
 
 async def manual_fallback_timeout(user_id: int, pay_id: str, amount: float):
-    """If not auto-verified within 5 minutes, give the user a Manual(Admin) approval button."""
     await asyncio.sleep(300)
     pay = await payments_col.find_one({"_id": ObjectId(pay_id)})
     if not pay or pay.get("status") in ("SUCCESS", "MANUAL", "REJECTED"):
@@ -626,7 +754,6 @@ async def manual_fallback_timeout(user_id: int, pay_id: str, amount: float):
 
 # ==================== OTP LISTENER ENGINE WITH REFUND ====================
 async def _one_time_refund(user_id: int, acc_id: str, price: float) -> bool:
-    """Atomic one-time refund — dobara refund kabhi nahi milega same account pe."""
     acc = await accounts_col.find_one_and_update(
         {"_id": ObjectId(acc_id), "refunded": {"$ne": True}},
         {"$set": {"refunded": True, "status": "EXPIRED"}}
@@ -643,7 +770,6 @@ async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
         await app.send_message(user_id, "❌ **Account session record not found!**")
         return
 
-    # Already refunded pehle hi — koi aur refund nahi
     if acc.get("refunded"):
         await app.send_message(user_id, "⚠️ **This purchase was already refunded. No further refund available.**")
         return
@@ -663,7 +789,6 @@ async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
         if not await t_client.is_user_authorized():
             await t_client.disconnect()
 
-            # REFUND SIRF TAB: OTP deliver nahi hua + pehle refund nahi hua
             if not acc.get("otp_delivered", False):
                 refunded = await _one_time_refund(user_id, acc_id, price)
                 if refunded:
@@ -679,12 +804,11 @@ async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
                         f"📞 **Account:** `{mask_phone_number(phone_number)}`"
                     )
             else:
-                # OTP already deliver ho chuka tha — refund nahi, sirf info
                 await app.send_message(
                     user_id,
                     f"⚠️ **Session is no longer active for** `{phone_number}`.\n\n"
                     f"ℹ️ _OTP was already delivered earlier, so no refund is applicable. "
-                    f"Account ki login details aapke paas already hain._"
+                    f"The account login details are already with you._"
                 )
             return
 
@@ -697,7 +821,6 @@ async def fetch_latest_otp(user_id: int, acc_id: str, is_manual: bool = False):
         await t_client.disconnect()
 
         if latest_otp:
-            # Mark OTP delivered — iske baad kabhi refund nahi hoga
             await accounts_col.update_one(
                 {"_id": ObjectId(acc_id), "otp_delivered": {"$ne": True}},
                 {"$set": {"otp_delivered": True}}
@@ -741,7 +864,6 @@ async def listen_for_otp(user_id: int, phone_number: str, session_string: str, t
 
         if not await t_client.is_user_authorized():
             await t_client.disconnect()
-            # One-time refund only if OTP never delivered
             refunded = await _one_time_refund(user_id, acc_id, price)
             if refunded:
                 await app.send_message(
@@ -778,36 +900,48 @@ def get_main_menu_keyboard(user_id: int):
     return InlineKeyboardMarkup(buttons)
 
 def get_admin_panel_keyboard(user_id: int):
-    row_1 = [
-        InlineKeyboardButton("➕ Add Account Stock", callback_data="admin_add_acc"),
-        InlineKeyboardButton("🗑️ Remove Stock", callback_data="admin_remove_stock")
-    ]
+    is_owner = (user_id == OWNER_ID)
 
-    row_2 = []
-    if user_id == OWNER_ID:
-        row_2.append(InlineKeyboardButton("🏷️ Change Price / Cashback (Owner)", callback_data="admin_change_price"))
+    row_1 = []
+    if has_perm(user_id, "add_acc"):
+        row_1.append(InlineKeyboardButton("➕ Add Account Stock", callback_data="admin_add_acc"))
+    if has_perm(user_id, "remove_stock"):
+        row_1.append(InlineKeyboardButton("🗑️ Remove Stock", callback_data="admin_remove_stock"))
 
-    buttons = [row_1]
-    if row_2:
-        buttons.append(row_2)
+    buttons = [row_1] if row_1 else []
 
-    if user_id == OWNER_ID:
+    if is_owner:
+        buttons.append([InlineKeyboardButton("🏷️ Change Price / Cashback (Owner)", callback_data="admin_change_price")])
         buttons.append([InlineKeyboardButton("➕ Add User Balance", callback_data="admin_edit_bal"), InlineKeyboardButton("➖ Deduct User Balance", callback_data="admin_deduct_bal")])
 
-    buttons.append([
-        InlineKeyboardButton("📊 Stats & Revenue", callback_data="admin_stats"),
-        InlineKeyboardButton("ℹ️ User History & Info", callback_data="admin_user_history")
-    ])
+    stats_history_row = []
+    if has_perm(user_id, "stats"):
+        stats_history_row.append(InlineKeyboardButton("📊 Stats & Revenue", callback_data="admin_stats"))
+    if has_perm(user_id, "user_history"):
+        stats_history_row.append(InlineKeyboardButton("ℹ️ User History & Info", callback_data="admin_user_history"))
+    if stats_history_row:
+        buttons.append(stats_history_row)
 
-    buttons.append([
-        InlineKeyboardButton("🛠️ Maintenance Mode", callback_data="admin_maint_panel"),
-        InlineKeyboardButton("📢 Broadcast DM", callback_data="admin_broadcast")
-    ])
+    maint_broadcast_row = []
+    if has_perm(user_id, "maintenance"):
+        maint_broadcast_row.append(InlineKeyboardButton("🛠️ Maintenance Mode", callback_data="admin_maint_panel"))
+    if has_perm(user_id, "broadcast"):
+        maint_broadcast_row.append(InlineKeyboardButton("📢 Broadcast DM", callback_data="admin_broadcast"))
+    if maint_broadcast_row:
+        buttons.append(maint_broadcast_row)
 
-    buttons.append([InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban_user"), InlineKeyboardButton("🟢 Unban User", callback_data="admin_unban_user")])
+    ban_unban_row = []
+    if has_perm(user_id, "ban"):
+        ban_unban_row.append(InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban_user"))
+    if has_perm(user_id, "unban"):
+        ban_unban_row.append(InlineKeyboardButton("🟢 Unban User", callback_data="admin_unban_user"))
+    if ban_unban_row:
+        buttons.append(ban_unban_row)
 
-    if user_id == OWNER_ID:
+    if is_owner:
         buttons.append([InlineKeyboardButton("👥 Manage Admins (Owner Only)", callback_data="admin_manage_sudo")])
+        # --- SECTION 8: Button Maintenance (Owner Only) ---
+        buttons.append([InlineKeyboardButton("🧩 Button Maintenance (Owner)", callback_data="admin_btn_maint_panel")])
 
     buttons.append([InlineKeyboardButton("🔙 Exit Admin Panel", callback_data="user_main_menu")])
     return InlineKeyboardMarkup(buttons)
@@ -830,7 +964,13 @@ async def get_manage_sudo_keyboard():
     sudo_docs = await sudo_col.find({"user_id": {"$ne": OWNER_ID}}).to_list(length=100)
     for doc in sudo_docs:
         s_id = doc["user_id"]
-        buttons.append([InlineKeyboardButton(f"❌ Remove {s_id}", callback_data=f"adm_rem_sudo_{s_id}")])
+        perms = ADMIN_PERMS.get(s_id, set())
+        perm_count = len(perms)
+        buttons.append([InlineKeyboardButton(
+            f"⚙️ Edit Powers {s_id} ({perm_count} ON)",
+            callback_data=f"adm_view_sudo_{s_id}"
+        )])
+        buttons.append([InlineKeyboardButton(f"🗑️ Remove {s_id}", callback_data=f"adm_rem_ask_{s_id}")])
 
     buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(buttons)
@@ -851,7 +991,6 @@ async def start_handler(client: Client, message: Message):
         await message.reply_text(f"🚧 **SYSTEM MAINTENANCE MODE ACTIVE** 🚧\n\n**Message:** {maint_reason}\n\n*All bot operations are temporarily paused. Please try again later.*")
         return
 
-    # Force-join gate (owner/admins exempt)
     if user_id not in SUDO_USERS and user_id != OWNER_ID:
         missing = await not_joined_channels(user_id)
         if missing:
@@ -888,8 +1027,13 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.answer(f"🚧 Bot is under maintenance!\nReason: {maint_reason}", show_alert=True)
         return
 
+    # ---- SECTION 5: PER-BUTTON MAINTENANCE GATE (owner/admin bypass, mtn_ + admin_panel + menu exempt) ----
+    maint_msg = check_btn_maintenance(data, user_id)
+    if maint_msg and not (data.startswith("mtn_") or data.startswith("admin_btn_maint") or data == "admin_panel" or data == "user_main_menu"):
+        await query.answer(maint_msg, show_alert=True)
+        return
+
     if data == "check_join":
-        # Owner/admins hamesha bypass
         if user_id in SUDO_USERS or user_id == OWNER_ID:
             missing = []
         else:
@@ -995,6 +1139,7 @@ async def callback_router(client: Client, query: CallbackQuery):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
         )
 
+    # ---- SECTION 2: auto_check_pay_ (UTR input prompt) ----
     elif data.startswith("auto_check_pay_"):
         pay_id = data.split("_")[3]
         pay_doc = await payments_col.find_one({"_id": ObjectId(pay_id)})
@@ -1009,7 +1154,9 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         user_states[user_id] = f"WAIT_AUTO_TXN_ID_{pay_id}"
         await query.message.reply_text(
-            "🧾 **Please enter the Transaction ID / UTR Number to check payment:**"
+            "🧾 **Please enter the EXACT UTR / Transaction ID of your payment:**\n\n"
+            "ℹ️ _The UTR is the 12-digit number found in your UPI app's payment details. "
+            "Entering a wrong UTR will fail the verification._"
         )
 
     elif data.startswith("auto_to_manual_"):
@@ -1189,7 +1336,6 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         flag = get_flag(c_name)
 
-        # ---- GC / LOG CHANNEL: NEW NUMBER PURCHASED (masked number) ----
         try:
             purchased_log = (
                 f"🛒 **NEW NUMBER PURCHASED!**\n\n"
@@ -1285,7 +1431,6 @@ async def callback_router(client: Client, query: CallbackQuery):
                 await query.message.reply_text(f"⚠️ **Account Session Expired or Closed:** `{acc['phone_number']}`")
                 return
 
-            # FRESH device list fetch karo — stale list ka hash invalid hota hai
             authorizations = await t_client(GetAuthorizationsRequest())
             valid_hashes = {a.hash for a in authorizations.authorizations}
 
@@ -1323,7 +1468,6 @@ async def callback_router(client: Client, query: CallbackQuery):
             await query.message.reply_text("❌ **Account session record not found!**")
             return
 
-        # Logout se pehle delivery mark — iske baad refund bilkul nahi hoga
         await accounts_col.update_one(
             {"_id": ObjectId(acc_id)},
             {"$set": {"otp_delivered": True, "delivered_final": True}}
@@ -1337,7 +1481,6 @@ async def callback_router(client: Client, query: CallbackQuery):
         except Exception as e:
             await query.message.reply_text(f"⚠️ Session notice: `{e}`")
 
-        # ---- CASHBACK OFFER (after logout) ----
         if float(acc.get("cashback", 0.0) or 0.0) > 0 and not acc.get("cashback_claimed", False):
             acc_cb = float(acc.get("cashback", 0.0) or 0.0)
             kb = InlineKeyboardMarkup([
@@ -1360,7 +1503,6 @@ async def callback_router(client: Client, query: CallbackQuery):
     elif data.startswith("cbtoprofile_") or data.startswith("cbtowithdraw_"):
         acc_id = data.split("_", 1)[1]
 
-        # Atomic claim — dobara click se double credit nahi hoga
         acc_doc = await accounts_col.find_one_and_update(
             {"_id": ObjectId(acc_id), "cashback_claimed": {"$ne": True}},
             {"$set": {"cashback_claimed": True}}
@@ -1372,7 +1514,6 @@ async def callback_router(client: Client, query: CallbackQuery):
         amount = float(acc_doc.get("cashback", 0.0) or 0.0)
 
         if data.startswith("cbtoprofile_"):
-            # Profile cashback = locked, withdraw me use NAHI hoga
             await update_profile_cashback(user_id, amount)
             await query.message.edit_text(
                 f"✅ **₹{amount:.2f} Cashback added to your Profile!**\n\n"
@@ -1387,11 +1528,10 @@ async def callback_router(client: Client, query: CallbackQuery):
                 f"📌 **Type:** Profile Cashback (Locked)"
             )
         else:
-            # Withdrawable cashback balance
             await update_withdraw_cashback(user_id, amount)
             await query.message.edit_text(
                 f"✅ **₹{amount:.2f} Cashback added to your Withdraw Balance!**\n\n"
-                f"💸 You can now withdraw it from **Withdraw Cashback** menu.",
+                f"💸 You can now withdraw it from the **Withdraw Cashback** menu.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💸 Withdraw Cashback", callback_data="user_withdraw_menu")],
                                                     [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="user_main_menu")]])
             )
@@ -1430,8 +1570,43 @@ async def callback_router(client: Client, query: CallbackQuery):
         user_states.pop(user_id, None)
         await query.message.edit_text("⚙️ **Admin Dashboard**", reply_markup=get_admin_panel_keyboard(user_id))
 
+    # ---- SECTION 6: BUTTON MAINTENANCE PANEL (OWNER ONLY) ----
+    elif data == "admin_btn_maint_panel":
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Only Owner can access Button Maintenance!", show_alert=True)
+            return
+        await load_button_maintenance()
+        await query.message.edit_text(
+            "🧩 **BUTTON MAINTENANCE PANEL (Owner Only)**\n\n"
+            "🟢 = Button Active | 🚧 = Button Under Maintenance\n\n"
+            "Tap any button to toggle its maintenance status:",
+            reply_markup=get_btn_maint_keyboard()
+        )
+
+    elif data.startswith("mtn_btn_"):
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Owner Only!", show_alert=True)
+            return
+        key = data.replace("mtn_btn_", "", 1)
+        if key in MAINT_CACHE:
+            # Already under maintenance → turn OFF
+            await set_btn_maintenance(key, False)
+            await load_button_maintenance()
+            await query.answer("✅ Button maintenance turned OFF!", show_alert=False)
+            await query.message.edit_reply_markup(reply_markup=get_btn_maint_keyboard())
+        else:
+            # Turn ON → ask reason first
+            temp_data[user_id] = {"mtn_key": key}
+            user_states[user_id] = "WAIT_BTN_MAINT_REASON"
+            label = BTN_LABELS.get(key, key)
+            await query.message.edit_text(
+                f"🚧 **ENABLE MAINTENANCE: {label}**\n\n"
+                f"📝 Send the reason/message users will see when they tap this button:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_btn_maint_panel")]])
+            )
+
     elif data == "admin_maint_panel":
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "maintenance"): return
         user_states.pop(user_id, None)
         is_active, reason = await get_maintenance_status()
         status_text = "🟢 **ONLINE (Active)**" if not is_active else "🔴 **MAINTENANCE MODE (Paused)**"
@@ -1445,7 +1620,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data == "adm_toggle_maint":
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "maintenance"): return
         is_active, reason = await get_maintenance_status()
         new_state = not is_active
         await set_maintenance_status(new_state)
@@ -1464,7 +1639,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data == "adm_change_maint_reason":
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "maintenance"): return
         user_states[user_id] = "ADM_STEP_MAINT_REASON"
         await query.message.edit_text(
             "✏️ **SET MAINTENANCE REASON / TEXT**\n\n"
@@ -1473,7 +1648,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data == "admin_stats":
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "stats"): return
         await query.answer("📊 Calculating revenue & stats...", show_alert=False)
 
         total_users = await users_col.count_documents({})
@@ -1508,7 +1683,6 @@ async def callback_router(client: Client, query: CallbackQuery):
         withdraw_cb_total = user_cb_res[0]["total_withdraw_cb"] if user_cb_res else 0.0
         total_usdt_held = float(user_cb_res[0]["total_usdt"] if user_cb_res else 0.0)
 
-        # --- Total deposits (investment) summary ---
         dep_pipeline = [
             {"$match": {"currency": "INR", "amount": {"$gt": 0}}},
             {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}}
@@ -1554,7 +1728,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data == "admin_user_history":
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "user_history"): return
         user_states[user_id] = "ADM_STEP_GET_USER_HISTORY"
         await query.message.edit_text(
             "ℹ️ **FETCH USER DETAILS & HISTORY**\n\n"
@@ -1563,7 +1737,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data == "admin_add_acc":
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "add_acc"): return
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("⚡ Temporary Spam", callback_data="adm_cat_Temporary Spam")],
             [InlineKeyboardButton("🚫 Permanent Spam", callback_data="adm_cat_Permanent Spam")],
@@ -1574,7 +1748,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_text("📂 **Select Account Category:**", reply_markup=kb)
 
     elif data == "admin_remove_stock":
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "remove_stock"): return
 
         pipeline = [
             {"$match": {"status": "AVAILABLE"}},
@@ -1613,7 +1787,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_text("🗑️ **Select Stock Item to Remove/Delete:**", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("adm_rmstk_"):
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "remove_stock"): return
         sample_id = data.split("_")[2]
 
         sample_doc = await accounts_col.find_one({"_id": ObjectId(sample_id)})
@@ -1751,14 +1925,98 @@ async def callback_router(client: Client, query: CallbackQuery):
             return
         user_states.pop(user_id, None)
         kb = await get_manage_sudo_keyboard()
-        await query.message.edit_text("👥 **MANAGE ADMINS**", reply_markup=kb)
+        await query.message.edit_text("👥 **MANAGE ADMINS (Owner Only)**", reply_markup=kb)
 
     elif data == "adm_add_sudo_btn":
         if user_id != OWNER_ID: return
         user_states[user_id] = "ADM_STEP_INPUT_ADD_SUDO"
         await query.message.edit_text(
-            "➕ **ADD NEW ADMIN**\n\nSend the **Telegram User ID** of the person you want to make Admin:",
+            "➕ **ADD NEW ADMIN**\n\n"
+            "Send the **Telegram User ID** of the person you want to make Admin.\n"
+            "After that you'll get a toggle menu of powers (✅/❌) — turn ON the powers you want to grant, then press Save:",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Manage Admins", callback_data="admin_manage_sudo")]])
+        )
+
+    elif data.startswith("adm_view_sudo_"):
+        if user_id != OWNER_ID: return
+        target_id = int(data.split("_")[3])
+        perms = ADMIN_PERMS.get(target_id, set())
+        temp_data[user_id] = {"perm_target_id": target_id, "perms": set(perms)}
+        kb = build_admin_perm_keyboard(target_id, perms)
+        perm_lines = "\n".join([f"{'✅' if k in perms else '❌'} {label}" for k, label in PERMISSION_LIST])
+        await query.message.edit_text(
+            f"⚙️ **EDIT ADMIN POWERS: `{target_id}`**\n\n"
+            f"🔐 **Current Powers:**\n{perm_lines}\n\n"
+            f"ℹ️ _Tap any button to **enable/disable** that power. "
+            f"After making changes, press **Save Admin Powers**._\n\n"
+            f"🗑️ **Remove Admin:** use the Remove button below (with confirmation).",
+            reply_markup=kb
+        )
+
+    elif data.startswith("adm_perm_toggle_"):
+        if user_id != OWNER_ID: return
+        if user_id not in temp_data or "perms" not in temp_data.get(user_id, {}):
+            await query.answer("⚠️ Session expired! Reopen the admin powers menu.", show_alert=True)
+            return
+        perm_key = data.replace("adm_perm_toggle_", "")
+        perms = temp_data[user_id]["perms"]
+        if perm_key in perms:
+            perms.discard(perm_key)
+        else:
+            perms.add(perm_key)
+        temp_data[user_id]["perms"] = perms
+        target_id = temp_data[user_id]["perm_target_id"]
+        kb = build_admin_perm_keyboard(target_id, perms)
+        try:
+            await query.message.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+        await query.answer(f"⚙️ {perm_key}: {'ENABLED ✅' if perm_key in perms else 'DISABLED ❌'}", show_alert=False)
+
+    elif data.startswith("adm_perm_save_"):
+        if user_id != OWNER_ID: return
+        if user_id not in temp_data or "perms" not in temp_data.get(user_id, {}):
+            await query.answer("⚠️ Session expired! Reopen the menu.", show_alert=True)
+            return
+        target_id = temp_data[user_id]["perm_target_id"]
+        perms = temp_data[user_id]["perms"]
+        temp_data.pop(user_id, None)
+
+        await add_sudo_user(target_id)
+        await set_admin_perms(target_id, perms)
+
+        perm_lines = "\n".join([f"{'✅' if k in perms else '❌'} {label}" for k, label in PERMISSION_LIST])
+        await query.answer("✅ Admin Powers Saved!", show_alert=True)
+        await query.message.edit_text(
+            f"✅ **ADMIN POWERS UPDATED!**\n\n"
+            f"👤 **Admin ID:** `{target_id}`\n\n"
+            f"🔐 **Assigned Powers:**\n{perm_lines}\n\n"
+            f"ℹ️ _This admin can now only use the ✅ powers assigned above._",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Manage Admins", callback_data="admin_manage_sudo")]])
+        )
+        try:
+            await app.send_message(
+                target_id,
+                f"🔄 **Your Admin Powers were updated by Owner!**\n\n"
+                f"🔐 **Current Powers:**\n{perm_lines}\n\n"
+                f"Use /admin command to open the Admin Dashboard."
+            )
+        except Exception as e:
+            logging.error(f"admin perm notify error: {e}")
+
+    elif data.startswith("adm_rem_ask_"):
+        if user_id != OWNER_ID: return
+        target_id = int(data.split("_")[3])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, Remove This Admin", callback_data=f"adm_rem_sudo_{target_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_manage_sudo")]
+        ])
+        await query.message.edit_text(
+            f"⚠️ **REMOVE ADMIN CONFIRMATION**\n\n"
+            f"👤 **Admin ID:** `{target_id}`\n\n"
+            f"Are you sure? On removal, **all his powers** will also be deleted "
+            f"and he will become a normal user.",
+            reply_markup=kb
         )
 
     elif data.startswith("adm_rem_sudo_"):
@@ -1770,8 +2028,8 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_text("👥 **MANAGE ADMINS**", reply_markup=kb)
 
     elif data.startswith("adm_cat_"):
-        if user_id not in SUDO_USERS: return
-        cat = data.split("_")[2]
+        if not has_perm(user_id, "add_acc"): return
+        cat = data.split("_", 2)[2]
         temp_data[user_id] = {"category": cat}
         user_states[user_id] = "ADM_STEP_COUNTRY"
         await query.message.edit_text(
@@ -1780,7 +2038,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data == "admin_broadcast":
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "broadcast"): return
         user_states[user_id] = "ADM_STEP_BROADCAST"
         await query.message.edit_text(
             "📢 **Send the message you want to Broadcast in DM to all users:**",
@@ -1788,7 +2046,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data == "admin_ban_user":
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "ban"): return
         user_states[user_id] = "ADM_STEP_BAN_ID"
         await query.message.edit_text(
             "🚫 **Enter User ID or @Username to Ban:**",
@@ -1796,15 +2054,15 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data == "admin_unban_user":
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "unban"): return
         user_states[user_id] = "ADM_STEP_UNBAN_ID"
         await query.message.edit_text(
             "🟢 **Enter User ID or @Username to Unban:**",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
         )
 
-    elif data.startswith("adm_app_dep_"):
-        if user_id not in SUDO_USERS: return
+    elif data.startswith("adm_app_dep_") and not data.startswith("adm_app_dep_usdt_"):
+        if not has_perm(user_id, "deposit_approve"): return
         _, _, _, dep_user_id, amount, req_id = data.split("_")
         dep_user_id = int(dep_user_id)
         amount = float(amount)
@@ -1819,7 +2077,6 @@ async def callback_router(client: Client, query: CallbackQuery):
             return
 
         await update_balance(dep_user_id, amount)
-        # ---- DEPOSIT LEDGER + OWNER ALERT (admin ne manually credit kiya) ----
         await record_deposit(dep_user_id, amount, currency="INR", dep_type="MANUAL", approved_by=user_id)
         admin_mention = query.from_user.mention
 
@@ -1846,9 +2103,8 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
         await log_to_channel(log_text)
 
-    # ---- CRYPTO (USDT) DEPOSIT APPROVAL ----
     elif data.startswith("adm_app_dep_usdt_"):
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "deposit_approve"): return
         parts = data.split("_")
         dep_user_id, amount_usdt, req_id = int(parts[4]), float(parts[5]), parts[6]
 
@@ -1862,7 +2118,6 @@ async def callback_router(client: Client, query: CallbackQuery):
             return
 
         await update_usdt_balance(dep_user_id, amount_usdt)
-        # ---- DEPOSIT LEDGER + OWNER ALERT ----
         await record_deposit(dep_user_id, amount_usdt, currency="USDT", dep_type="USDT", approved_by=user_id)
         admin_mention = query.from_user.mention
 
@@ -1886,7 +2141,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         await log_to_channel(log_text)
 
     elif data.startswith("adm_rej_dep_usdt_"):
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "deposit_approve"): return
         parts = data.split("_")
         dep_user_id, req_id = int(parts[4]), parts[5]
 
@@ -1908,7 +2163,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         await app.send_message(dep_user_id, "❌ Your crypto deposit request was rejected by Admin.")
 
     elif data.startswith("adm_rej_dep_"):
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "deposit_approve"): return
         _, _, _, dep_user_id, req_id = data.split("_")
         dep_user_id = int(dep_user_id)
 
@@ -2058,6 +2313,7 @@ async def text_router(client: Client, message: Message):
     if not state:
         return
 
+    # ---- SECTION 3: STRICT UTR VERIFICATION STATE ----
     if state.startswith("WAIT_AUTO_TXN_ID_"):
         pay_id = state.replace("WAIT_AUTO_TXN_ID_", "")
         txn_id = message.text.strip()
@@ -2070,27 +2326,24 @@ async def text_router(client: Client, message: Message):
 
         expected_amount = pay_doc["amount"]
 
-        await message.reply_text("🔍 **Checking payment status automatically...**")
-        is_valid = await check_auto_payment_status(txn_id, expected_amount)
+        await message.reply_text("🔍 **Verifying UTR against payment records...**")
+        is_valid, result_msg = await check_auto_payment_status(pay_id, txn_id)
 
         if is_valid:
-            await payments_col.update_one({"_id": ObjectId(pay_id)}, {"$set": {"status": "SUCCESS", "txn_id": txn_id}})
-            await update_balance(user_id, expected_amount)
-            # ---- DEPOSIT LEDGER ENTRY (AUTO deposit, admin nahi — owner ko alert nahi) ----
-            await record_deposit(user_id, expected_amount, currency="INR", dep_type="AUTO", approved_by=None, note=f"UTR: {txn_id}")
             user_states.pop(user_id, None)
 
             await message.reply_text(
                 f"🎉 **PAYMENT RECEIVED & VERIFIED!**\n\n"
-                f"✅ Credited **₹{expected_amount:.2f}** to your wallet balance."
+                f"✅ Credited **₹{expected_amount:.2f}** to your wallet balance.\n"
+                f"🧾 **UTR:** `{txn_id}`"
             )
 
             log_text = (
                 f"⚡ **AUTO DEPOSIT SUCCESSFUL (UPI / INR)**\n\n"
                 f"👤 **User ID:** `{user_id}`\n"
                 f"💵 **Amount:** ₹{expected_amount:.2f}\n"
-                f"🧾 **Txn ID:** `{txn_id}`\n\n"
-                f"📌 **Status:** Automatically Credited & Approved"
+                f"🧾 **UTR:** `{txn_id}`\n\n"
+                f"📌 **Status:** Strict UTR Verified & Credited"
             )
             await log_to_channel(log_text)
         else:
@@ -2099,8 +2352,9 @@ async def text_router(client: Client, message: Message):
                                       callback_data=f"auto_to_manual_{pay_id}")]
             ])
             await message.reply_text(
-                "❌ **Payment Not Verified!**\n\nIf you have paid, press the button below and "
-                "send the screenshot — our admin will approve it.",
+                f"❌ **Payment Not Verified!**\n\n{result_msg}\n\n"
+                f"If you have already paid, press the button below and send the screenshot — "
+                f"our admin will approve it manually.",
                 reply_markup=kb,
             )
 
@@ -2118,11 +2372,11 @@ async def text_router(client: Client, message: Message):
                 f"🟡 **DEPOSIT DETAILS**\n\n"
                 f"📌 **Binance Pay UID:** `{BINANCE_ID}`\n"
                 f"💵 **Amount:** {amount_usdt:.2f} USDT\n\n"
-                f"Now send the **payment proof** here — screenshot ya TxHash text dono chalega.\n"
-                f"Admin verify karke aapke **USDT balance** me credit karega."
+                f"Now send the **payment proof** here — you can send a screenshot or TxHash text.\n"
+                f"Admin will verify it and credit your **USDT balance**."
             )
         except ValueError:
-            await message.reply_text("❌ Invalid input! Sirf number bhejo (e.g. `5`):")
+            await message.reply_text("❌ Invalid input! Send numbers only (e.g. `5`):")
 
     elif state == "WAIT_DEPOSIT_AMOUNT_MANUAL":
         try:
@@ -2170,7 +2424,7 @@ async def text_router(client: Client, message: Message):
             caption = (
                 f"💳 **Pay ₹{amount:.2f} using QR code above (UPI / INR)**\n\n"
                 f"📌 **UPI ID:** `{UPI_ID_TEXT}`\n\n"
-                f"After paying, press the **Check Payment** button below to complete verification."
+                f"After paying, press the **Check Payment** button below and enter your **EXACT UTR number** to complete verification."
             )
 
             await app.send_photo(
@@ -2219,7 +2473,7 @@ async def text_router(client: Client, message: Message):
                 logging.error(f"Failed sending DM to Admin {sudo_id}: {e}")
 
     elif state == "ADM_STEP_GET_USER_HISTORY":
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "user_history"): return
         try:
             target_id = int(message.text.strip())
             u_data = await users_col.find_one({"user_id": target_id})
@@ -2234,7 +2488,6 @@ async def text_router(client: Client, message: Message):
 
             purchased_accs = await accounts_col.find({"sold_to": target_id, "status": "SOLD"}).to_list(length=100)
 
-            # ---- DEPOSIT SUMMARY (Total Investment) ----
             dep_sum = await get_user_deposit_summary(target_id)
 
             history_text = ""
@@ -2246,7 +2499,6 @@ async def text_router(client: Client, message: Message):
             else:
                 history_text = "\n\n📦 **Purchased Accounts History:** No accounts purchased yet."
 
-            # ---- Recent Deposit History (last 5) ----
             dep_history_text = ""
             if dep_sum["recent"]:
                 dep_history_text = "\n\n📥 **Recent Deposit History (Last 5):**\n"
@@ -2291,13 +2543,32 @@ async def text_router(client: Client, message: Message):
             await message.reply_text("❌ Invalid User ID! Please enter numeric User ID only:")
 
     elif state == "ADM_STEP_MAINT_REASON":
-        if user_id not in SUDO_USERS: return
+        if not has_perm(user_id, "maintenance"): return
         new_reason = message.text.strip()
         is_active, _ = await get_maintenance_status()
         await set_maintenance_status(is_active, new_reason)
         user_states.pop(user_id, None)
         kb = await get_maintenance_panel_keyboard()
         await message.reply_text(f"✅ **Maintenance Reason Updated!**\n\n`{new_reason}`", reply_markup=kb)
+
+    # ---- SECTION 7: BUTTON MAINTENANCE REASON INPUT ----
+    elif state == "WAIT_BTN_MAINT_REASON":
+        if user_id != OWNER_ID: return
+        key = temp_data.pop(user_id, {}).get("mtn_key")
+        user_states.pop(user_id, None)
+        if not key:
+            await message.reply_text("❌ Session expired! Try again.")
+            return
+        reason = message.text.strip()
+        await set_btn_maintenance(key, True, reason)
+        await load_button_maintenance()
+        label = BTN_LABELS.get(key, key)
+        await message.reply_text(
+            f"✅ **Maintenance Enabled!**\n\n"
+            f"🔧 **Button:** {label}\n"
+            f"📝 **Reason:** {reason}",
+            reply_markup=get_btn_maint_keyboard()
+        )
 
     elif state == "WAIT_WITHDRAW_AMOUNT":
         try:
@@ -2393,7 +2664,6 @@ async def text_router(client: Client, message: Message):
             add_amount = float(parts[1])
 
             await update_balance(t_user_id, add_amount)
-            # ---- DEPOSIT LEDGER + OWNER ALERT (owner khud credit kar raha hai, alert khud ko nahi) ----
             await record_deposit(t_user_id, add_amount, currency="INR", dep_type="ADMIN_CREDIT", approved_by=user_id)
             new_total = await get_user_balance(t_user_id)
 
@@ -2437,7 +2707,6 @@ async def text_router(client: Client, message: Message):
                 return
 
             await update_balance(t_user_id, -deduct_amount)
-            # ---- DEDUCT bhi ledger me negative entry ke saath record hota hai ----
             await record_deposit(t_user_id, -deduct_amount, currency="INR", dep_type="ADMIN_CREDIT", approved_by=user_id, note="Balance deducted")
             new_total = await get_user_balance(t_user_id)
 
@@ -2456,14 +2725,32 @@ async def text_router(client: Client, message: Message):
         if user_id != OWNER_ID: return
         try:
             target_id = int(message.text.strip())
-            await add_sudo_user(target_id)
+
+            if target_id == OWNER_ID:
+                await message.reply_text("❌ Owner already has ALL powers!")
+                user_states.pop(user_id, None)
+                return
+
+            existing_perms = ADMIN_PERMS.get(target_id, set())
+
             user_states.pop(user_id, None)
-            kb = await get_manage_sudo_keyboard()
-            await message.reply_text(f"✅ User `{target_id}` added to Admins!", reply_markup=kb)
+            temp_data[user_id] = {"perm_target_id": target_id, "perms": set(existing_perms)}
+
+            kb = build_admin_perm_keyboard(target_id, existing_perms)
+            perm_lines = "\n".join([f"{'✅' if k in existing_perms else '❌'} {label}" for k, label in PERMISSION_LIST])
+            await message.reply_text(
+                f"⚙️ **ADMIN POWERS SETUP: `{target_id}`**\n\n"
+                f"🔐 **Current Powers:**\n{perm_lines}\n\n"
+                f"ℹ️ _Tap any button to **enable (✅) / disable (❌)** that power — "
+                f"turn ON the powers you want to grant, then press **Save Admin Powers** below._\n\n"
+                f"🗑️ _To remove this admin, use the Remove button in Manage Admins._",
+                reply_markup=kb
+            )
         except ValueError:
             await message.reply_text("❌ Invalid User ID! Enter numbers only:")
 
     elif state == "ADM_STEP_BROADCAST":
+        if not has_perm(user_id, "broadcast"): return
         user_states.pop(user_id, None)
         broadcast_msg = message.text
         cursor = users_col.find({"is_banned": False})
@@ -2484,6 +2771,7 @@ async def text_router(client: Client, message: Message):
         await message.reply_text(f"✅ **Broadcast Completed!**\n\n🟢 Delivered: {success}\n🔴 Failed: {failed}", reply_markup=get_admin_panel_keyboard(user_id))
 
     elif state == "ADM_STEP_BAN_ID":
+        if not has_perm(user_id, "ban"): return
         try:
             target_user = (await client.get_users(message.text.strip())).id
 
@@ -2499,6 +2787,7 @@ async def text_router(client: Client, message: Message):
             await message.reply_text("❌ Invalid User ID or Username:")
 
     elif state == "ADM_STEP_BAN_REASON":
+        if not has_perm(user_id, "ban"): return
         reason = message.text.strip()
         target_user = temp_data[user_id]["target_ban_user"]
         user_states.pop(user_id, None)
@@ -2507,6 +2796,7 @@ async def text_router(client: Client, message: Message):
         await message.reply_text(f"🚫 User `{target_user}` banned.\n**Reason:** {reason}", reply_markup=get_admin_panel_keyboard(user_id))
 
     elif state == "ADM_STEP_UNBAN_ID":
+        if not has_perm(user_id, "unban"): return
         try:
             target_user = (await client.get_users(message.text.strip())).id
             user_states.pop(user_id, None)
@@ -2516,6 +2806,7 @@ async def text_router(client: Client, message: Message):
             await message.reply_text("❌ Invalid User ID or Username:")
 
     elif state == "ADM_STEP_COUNTRY":
+        if not has_perm(user_id, "add_acc"): return
         c_input = message.text.strip()
         temp_data[user_id]["country"] = c_input
         user_states[user_id] = "ADM_STEP_YEAR"
@@ -2523,11 +2814,13 @@ async def text_router(client: Client, message: Message):
         await message.reply_text(f"{flag} **Step 2:** Enter Account Creation Year (e.g. `2022`, `2024`):")
 
     elif state == "ADM_STEP_YEAR":
+        if not has_perm(user_id, "add_acc"): return
         temp_data[user_id]["year"] = message.text.strip()
         user_states[user_id] = "ADM_STEP_PRICE"
         await message.reply_text("💵 **Step 3:** Enter Account Price (₹):")
 
     elif state == "ADM_STEP_PRICE":
+        if not has_perm(user_id, "add_acc"): return
         try:
             temp_data[user_id]["price"] = float(message.text.strip())
             user_states[user_id] = "ADM_STEP_CASHBACK_VAL"
@@ -2536,6 +2829,7 @@ async def text_router(client: Client, message: Message):
             await message.reply_text("❌ Please enter numbers only:")
 
     elif state == "ADM_STEP_CASHBACK_VAL":
+        if not has_perm(user_id, "add_acc"): return
         try:
             temp_data[user_id]["cashback"] = float(message.text.strip())
             user_states[user_id] = "ADM_STEP_PHONE"
@@ -2544,11 +2838,13 @@ async def text_router(client: Client, message: Message):
             await message.reply_text("❌ Please enter numbers only:")
 
     elif state == "ADM_STEP_PHONE":
+        if not has_perm(user_id, "add_acc"): return
         temp_data[user_id]["phone"] = message.text.strip()
         user_states[user_id] = "ADM_STEP_2FA"
         await message.reply_text("🔑 **Enter 2FA Password (If none, type `None`):**")
 
     elif state == "ADM_STEP_2FA":
+        if not has_perm(user_id, "add_acc"): return
         temp_data[user_id]["two_fa"] = message.text.strip()
         phone = temp_data[user_id]["phone"]
 
@@ -2562,6 +2858,7 @@ async def text_router(client: Client, message: Message):
         await message.reply_text("📲 **Enter Telegram OTP code received:**")
 
     elif state == "ADM_STEP_OTP":
+        if not has_perm(user_id, "add_acc"): return
         otp = message.text.strip()
         data = temp_data[user_id]
         t_client = data["client"]
@@ -2609,7 +2906,7 @@ async def text_router(client: Client, message: Message):
 
 # ==================== START SERVER ====================
 if __name__ == "__main__":
-    threading.Thread(target=_email_watcher_loop, daemon=True).start()   
+    threading.Thread(target=_email_watcher_loop, daemon=True).start()
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
     print("🚀 Mongo Engine Activated!")
