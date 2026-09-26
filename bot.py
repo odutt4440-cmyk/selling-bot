@@ -89,6 +89,7 @@ requests_col = db["requests"]
 settings_col = db["settings"]
 payments_col = db["payments"]
 fampay_credits_col = db["fampay_credits"]
+stock_logs_col = db["stock_logs"]
 deposits_col = db["deposits"]
 admin_perm_col = db["admin_permissions"]
 
@@ -942,6 +943,8 @@ def get_admin_panel_keyboard(user_id: int):
         buttons.append([InlineKeyboardButton("👥 Manage Admins (Owner Only)", callback_data="admin_manage_sudo")])
         # --- SECTION 8: Button Maintenance (Owner Only) ---
         buttons.append([InlineKeyboardButton("🧩 Button Maintenance (Owner)", callback_data="admin_btn_maint_panel")])
+        # --- Stock Add History (Owner Only) ---
+        buttons.append([InlineKeyboardButton("📜 Stock Add History (Owner)", callback_data="adm_stock_history")])
 
     buttons.append([InlineKeyboardButton("🔙 Exit Admin Panel", callback_data="user_main_menu")])
     return InlineKeyboardMarkup(buttons)
@@ -2027,6 +2030,34 @@ async def callback_router(client: Client, query: CallbackQuery):
         kb = await get_manage_sudo_keyboard()
         await query.message.edit_text("👥 **MANAGE ADMINS**", reply_markup=kb)
 
+    elif data == "adm_stock_history":
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Only Owner can view Stock History!", show_alert=True)
+            return
+        await query.answer("📜 Loading stock history...", show_alert=False)
+        logs = await stock_logs_col.find().sort("_id", -1).to_list(length=30)
+
+        if not logs:
+            text = "📜 **STOCK ADD HISTORY**\n\nNo stock has been added yet."
+        else:
+            text = "📜 **STOCK ADD HISTORY (Latest 30)**\n\n"
+            for idx, log in enumerate(logs, 1):
+                flag = get_flag(log.get("country", ""))
+                text += (
+                    f"{idx}. 👨‍💻 **Admin:** {log.get('admin_name', 'N/A')} (`{log.get('admin_id', 'N/A')}`)\n"
+                    f"   📞 **Phone:** `{log.get('phone_number', 'N/A')}`\n"
+                    f"   📂 {log.get('category', 'N/A')} | {flag} {log.get('country', 'N/A')} ({log.get('year', 'N/A')})\n"
+                    f"   💵 {price_label(log.get('price', 0.0))} | 🕐 {log.get('date_str', 'N/A')}\n\n"
+                )
+
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+
+        if len(text) > 4000:
+            await query.message.edit_text(
+                text[:4000] + "\n\n⚠️ _Showing latest 30 records only._", reply_markup=kb)
+        else:
+            await query.message.edit_text(text, reply_markup=kb)
+
     elif data.startswith("adm_cat_"):
         if not has_perm(user_id, "add_acc"): return
         cat = data.split("_", 2)[2]
@@ -2887,9 +2918,41 @@ async def text_router(client: Client, message: Message):
                 "session_string": session_str,
                 "two_fa": data["two_fa"],
                 "status": "AVAILABLE",
-                "sold_to": None
+                "sold_to": None,
+                "added_by": user_id,
+                "added_by_name": message.from_user.first_name or str(user_id),
+                "added_at": datetime.now()
             }
-            await accounts_col.insert_one(acc_doc)
+            res = await accounts_col.insert_one(acc_doc)
+
+            # Stock attribution log — payout proof (kis admin ne kaunsa number add kiya)
+            await stock_logs_col.insert_one({
+                "action": "ADD",
+                "admin_id": user_id,
+                "admin_name": message.from_user.first_name or str(user_id),
+                "account_id": str(res.inserted_id),
+                "phone_number": data["phone"],
+                "category": data["category"],
+                "country": data["country"],
+                "year": data["year"],
+                "price": data["price"],
+                "date_str": datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+            })
+
+            # Owner ko instant DM notification
+            try:
+                await app.send_message(
+                    OWNER_ID,
+                    f"📥 **NEW STOCK ADDED BY ADMIN**\n\n"
+                    f"👨‍💻 **Admin:** {message.from_user.mention} (`{user_id}`)\n"
+                    f"📞 **Phone:** `{data['phone']}`\n"
+                    f"📂 **Category:** {data['category']}\n"
+                    f"🌍 **Country:** {data['country']} ({data['year']})\n"
+                    f"💵 **Price:** {price_label(data['price'])}\n"
+                    f"🕐 **Time:** {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}"
+                )
+            except Exception:
+                pass
 
             user_states.pop(user_id, None)
             flag = get_flag(data['country'])
@@ -2897,7 +2960,8 @@ async def text_router(client: Client, message: Message):
                 f"✅ **Account Added to MongoDB Stock!**\n\n"
                 f"📂 **Category:** {data['category']}\n"
                 f"{flag} **Location:** {data['country']} ({data['year']})\n"
-                f"📞 **Phone:** `{data['phone']}`",
+                f"📞 **Phone:** `{data['phone']}`\n"
+                f"👨‍💻 **Added By:** `{user_id}` (logged for payout tracking)",
                 reply_markup=get_admin_panel_keyboard(user_id)
             )
 
