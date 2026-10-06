@@ -889,6 +889,62 @@ async def listen_for_otp(user_id: int, phone_number: str, session_string: str, t
     except Exception as e:
         logging.error(f"OTP Listener Error: {e}")
 
+async def show_buy_stock_list(query, c_name: str, cat: str, year=None):
+    """Show year selection (if multiple years) then the price list for a category."""
+    match = {"country": c_name, "category": cat, "status": "AVAILABLE"}
+    if year:
+        match["year"] = year
+
+    items = await accounts_col.aggregate([
+        {"$match": match},
+        {"$group": {"_id": {"year": "$year", "price": "$price"}, "count": {"$sum": 1}}},
+        {"$sort": {"_id.price": 1}}
+    ]).to_list(length=50)
+
+    if not items:
+        await query.answer("❌ Out of stock for this selection!", show_alert=True)
+        return
+
+    years = sorted(set(i["_id"]["year"] for i in items))
+    flag = get_flag(c_name)
+
+    # Multiple years exist and none selected yet -> show year buttons first
+    if len(years) > 1 and not year:
+        buttons = []
+        for y in years:
+            y_count = sum(i["count"] for i in items if i["_id"]["year"] == y)
+            buttons.append([InlineKeyboardButton(
+                f"📅 {y} ({y_count})",
+                callback_data=f"sel_year_{c_name}~{cat}~{y}"
+            )])
+        buttons.append([InlineKeyboardButton("🔙 Back to Categories", callback_data=f"sel_cntry_{c_name}")])
+        await query.message.edit_text(
+            f"📁 **{cat}** | {flag} {c_name.upper()}\n\nSelect creation year:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    # Single year (or year already selected) -> show price list directly
+    shown_year = year if year else years[0]
+    price_items = sorted(
+        [i for i in items if i["_id"]["year"] == shown_year],
+        key=lambda x: x["_id"]["price"]
+    )
+
+    buttons = []
+    for i in price_items:
+        price = i["_id"]["price"]
+        buttons.append([InlineKeyboardButton(
+            f"💵 {price_label(price)} | Stock: {i['count']}",
+            callback_data=f"sel_item_{c_name}~{cat}~{shown_year}~{price}"
+        )])
+    buttons.append([InlineKeyboardButton("🔙 Back to Categories", callback_data=f"sel_cntry_{c_name}")])
+
+    await query.message.edit_text(
+        f"📁 **{cat}** | {flag} {c_name.upper()} ({shown_year})\n\nSelect your package option below:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )        
+
 # ==================== MAIN MENUS ====================
 def get_main_menu_keyboard(user_id: int):
     buttons = [
@@ -1227,53 +1283,52 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.message.edit_text(header_text, reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("sel_cntry_"):
-        c_name = data.split("_")[2]
+        c_name = data.replace("sel_cntry_", "", 1)
 
-        pipeline = [
+        cats = await accounts_col.aggregate([
             {"$match": {"country": c_name, "status": "AVAILABLE"}},
-            {"$group": {
-                "_id": {
-                    "category": "$category",
-                    "year": "$year",
-                    "price": "$price"
-                },
-                "count": {"$sum": 1}
-            }}
-        ]
-        items = await accounts_col.aggregate(pipeline).to_list(length=100)
+            {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+            {"$sort": {"_id": 1}}
+        ]).to_list(length=50)
 
-        if not items:
+        if not cats:
             await query.answer("❌ Out of stock for this selection!", show_alert=True)
             return
 
         buttons = []
-        for item in items:
-            info = item["_id"]
-            cat = info.get("category", "General")
-            year = info["year"]
-            price = info["price"]
-            count = item["count"]
-
-            btn_text = f"📁 {cat} | Year: {year} | {price_label(price)} | Stock: {count}"
-            buttons.append([InlineKeyboardButton(btn_text, callback_data=f"sel_item_{c_name}_{cat}_{year}_{price}")])
-
+        for c in cats:
+            buttons.append([InlineKeyboardButton(
+                f"📁 {c['_id']} ({c['count']})",
+                callback_data=f"sel_cat_{c_name}~{c['_id']}"
+            )])
         buttons.append([InlineKeyboardButton("🔙 Back to Countries", callback_data="user_buy_menu")])
 
         flag = get_flag(c_name)
         await query.message.edit_text(
-            f"{flag} **{c_name.upper()} ACCOUNTS**\n\nSelect your package option below:",
+            f"{flag} **{c_name.upper()} ACCOUNTS**\n\nSelect category:",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
+    elif data.startswith("sel_cat_"):
+        payload = data.replace("sel_cat_", "", 1)
+        c_name, cat = payload.split("~", 1)
+        await show_buy_stock_list(query, c_name, cat)
+
+    elif data.startswith("sel_year_"):
+        payload = data.replace("sel_year_", "", 1)
+        c_name, cat, year = payload.split("~", 2)
+        await show_buy_stock_list(query, c_name, cat, year=year)
+
     elif data.startswith("sel_item_"):
-        parts = data.split("_")
-        c_name, cat, year, price = parts[2], parts[3], parts[4], float(parts[5])
+        payload = data.replace("sel_item_", "", 1)
+        c_name, cat, year, price = payload.split("~", 3)
+        price = float(price)
 
         flag = get_flag(c_name)
         bal = await get_user_balance(user_id)
 
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Confirm Purchase", callback_data=f"cnf_buy_{c_name}_{cat}_{year}_{price}")],
+            [InlineKeyboardButton("✅ Confirm Purchase", callback_data=f"cnf_buy_{c_name}~{cat}~{year}~{price}")],
             [InlineKeyboardButton("🔙 Cancel", callback_data="user_buy_menu")]
         ])
 
@@ -1288,8 +1343,9 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data.startswith("cnf_buy_"):
-        parts = data.split("_")
-        c_name, cat, year, price = parts[2], parts[3], parts[4], float(parts[5])
+        payload = data.replace("cnf_buy_", "", 1)
+        c_name, cat, year, price = payload.split("~", 3)
+        price = float(price)
 
         bal = await get_user_balance(user_id)
         if bal < price:
@@ -1298,7 +1354,7 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         flag = get_flag(c_name)
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Yes, Purchase Now", callback_data=f"cb_buy_yes_{c_name}_{cat}_{year}_{price}")],
+            [InlineKeyboardButton("✅ Yes, Purchase Now", callback_data=f"cb_buy_yes_{c_name}~{cat}~{year}~{price}")],
             [InlineKeyboardButton("❌ Cancel", callback_data="user_buy_menu")]
         ])
         await query.message.edit_text(
@@ -1313,8 +1369,9 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data.startswith("cb_buy_yes_"):
-        parts = data.split("_")
-        c_name, cat, year, price = parts[3], parts[4], parts[5], float(parts[6])
+        payload = data.replace("cb_buy_yes_", "", 1)
+        c_name, cat, year, price = payload.split("~", 3)
+        price = float(price)
 
         bal = await get_user_balance(user_id)
         if bal < price:
@@ -2984,7 +3041,7 @@ async def text_router(client: Client, message: Message):
 
     elif state == "ADM_STEP_COUNTRY":
         if not has_perm(user_id, "add_acc"): return
-        c_input = message.text.strip()
+        c_input = message.text.strip().title()
         temp_data[user_id]["country"] = c_input
         user_states[user_id] = "ADM_STEP_YEAR"
         flag = get_flag(c_input)
