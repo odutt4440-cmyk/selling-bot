@@ -18,6 +18,11 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FreshResetAuthorisationForbiddenError
 from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
+try:
+    from telethon.errors import QRLoginException
+except ImportError:
+    class QRLoginException(Exception):
+        pass
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson.objectid import ObjectId
 import threading
@@ -92,6 +97,7 @@ fampay_credits_col = db["fampay_credits"]
 stock_logs_col = db["stock_logs"]
 deposits_col = db["deposits"]
 admin_perm_col = db["admin_permissions"]
+pending_req_col = db["pending_requests"]
 
 SUDO_USERS = set()
 
@@ -294,6 +300,43 @@ async def log_to_channel(text: str, reply_markup=None):
             await app.send_message(target_chat, text, reply_markup=reply_markup)
         except Exception as e:
             logging.error(f"Log Channel Error: {e}")
+
+# ==================== PENDING REQUEST GUARD (MULTI-DEPOSIT PREVENTION) ====================
+async def has_pending_request(user_id: int) -> bool:
+    try:
+        doc = await pending_req_col.find_one({"user_id": user_id, "status": "PENDING"})
+        return doc is not None
+    except Exception as e:
+        logging.error(f"has_pending_request error: {e}")
+        return False
+
+async def create_pending_request(user_id: int, rtype: str, req_id: str = None):
+    try:
+        doc = {
+            "user_id": user_id,
+            "type": rtype,
+            "status": "PENDING",
+            "req_id": req_id,
+            "at": time.time(),
+            "date_str": datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+        }
+        await pending_req_col.insert_one(doc)
+    except Exception as e:
+        logging.error(f"create_pending_request error: {e}")
+
+async def resolve_pending_request(req_id: str, status: str = "RESOLVED"):
+    try:
+        await pending_req_col.update_many(
+            {"req_id": req_id, "status": "PENDING"},
+            {"$set": {"status": status, "resolved_at": time.time()}}
+        )
+    except Exception as e:
+        logging.error(f"resolve_pending_request error: {e}")
+
+def get_pending_block_text() -> str:
+    return ("⚠️ **You already have a PENDING deposit request!**\n\n"
+            "ℹ️ _Your previous deposit request is still awaiting admin approval / rejection. "
+            "Please wait until it is processed before sending a new one._")
 
 # ==================== SECTION 4: PER-BUTTON MAINTENANCE (OWNER ONLY PANEL) ====================
 BTN_LABELS = {
@@ -753,6 +796,248 @@ async def manual_fallback_timeout(user_id: int, pay_id: str, amount: float):
     except Exception as e:
         logging.error(f"manual_fallback_timeout: {e}")
 
+# ==================== EXPIRED SESSION SYSTEM ====================
+_sync_accounts = _sync_db["accounts"]
+MAIN_LOOP = None   # main bot loop — expired scan thread isko use karke Owner DM bhejta hai
+
+
+def _notify_owner_expired(acc):
+    """Owner ko expired account ka one-time DM bhejo (thread-safe scheduling)."""
+    if not MAIN_LOOP:
+        return
+    flag = get_flag(acc.get("country", ""))
+    text = (
+        f"💀 **EXPIRED SESSION DETECTED — STOCK SE REMOVED**\n\n"
+        f"📞 **Phone:** `{mask_phone_number(acc.get('phone_number', '?'))}`\n"
+        f"📂 **Category:** {acc.get('category', 'N/A')}\n"
+        f"{flag} **Country:** {acc.get('country', 'N/A')} ({acc.get('year', 'N/A')})\n"
+        f"💵 **Price:** {price_label(acc.get('price', 0.0))}\n"
+        f"🕐 **Time:** {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}\n\n"
+        f"ℹ️ _Account status → **EXPIRED** set kiya gaya hai aur available stock se hat gaya hai. "
+        f"Purge panel (🧹) se permanently delete kar sakte ho._"
+    )
+    try:
+        asyncio.run_coroutine_threadsafe(app.send_message(OWNER_ID, text), MAIN_LOOP)
+    except Exception as e:
+        logging.error(f"expired notify error: {e}")
+
+
+async def check_session_expired(session_string: str) -> bool:
+    """True = session dead (not authorized). False = session live."""
+    try:
+        t_client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        await t_client.connect()
+        ok = await t_client.is_user_authorized()
+        await t_client.disconnect()
+        return not ok
+    except Exception as e:
+        logging.error(f"check_session_expired error: {e}")
+        return True
+
+
+async def scan_and_mark_expired_accounts():
+    """AVAILABLE stock ke sab sessions check karo, dead sessions ko EXPIRED mark karo."""
+    try:
+        accs = list(_sync_accounts.find({"status": "AVAILABLE"}))
+    except Exception as e:
+        logging.error(f"expired scan fetch error: {e}")
+        return 0
+
+    expired_count = 0
+    for acc in accs:
+        try:
+            if await check_session_expired(acc.get("session_string", "")):
+                _sync_accounts.update_one(
+                    {"_id": acc["_id"]},
+                    {"$set": {"status": "EXPIRED"}}
+                )
+                expired_count += 1
+
+                if not acc.get("expiry_notified", False):
+                    _sync_accounts.update_one(
+                        {"_id": acc["_id"]},
+                        {"$set": {"expiry_notified": True}}
+                    )
+                    _notify_owner_expired(acc)
+        except Exception as e:
+            logging.error(f"expired scan acc error: {e}")
+
+    if expired_count > 0:
+        logging.info(f"Expired session scan: {expired_count} account(s) marked EXPIRED")
+    return expired_count
+
+
+async def _expired_session_loop():
+    await asyncio.sleep(60)   # bot start hone ka wait karo
+    while True:
+        try:
+            await scan_and_mark_expired_accounts()
+        except Exception as e:
+            logging.error(f"expired session scan error: {e}")
+        await asyncio.sleep(3600)
+
+
+def _expired_thread_runner():
+    try:
+        asyncio.run(_expired_session_loop())
+    except Exception as e:
+        logging.error(f"expired thread runner error: {e}")
+
+
+# ==================== QR LOGIN ADD FLOW ====================
+async def run_qr_login(user_id: int):
+    """QR-based account add — bot khud QR generate karta hai, target phone usse scan karta hai."""
+    data = temp_data.get(user_id, {})
+    t_client = None
+    try:
+        t_client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await t_client.connect()
+
+        authorized = False
+        for attempt in range(4):
+            qr_login = await t_client.qr_login()
+
+            qr_img = qrcode.make(qr_login.url)
+            bio = io.BytesIO()
+            bio.name = f"login_qr_{user_id}_{attempt}.png"
+            qr_img.save(bio, "PNG")
+            bio.seek(0)
+
+            try:
+                await app.send_photo(
+                    chat_id=user_id,
+                    photo=bio,
+                    caption=(
+                        f"📷 **SCAN THIS QR CODE** (Attempt {attempt + 1}/4)\n\n"
+                        f"1️⃣ Target phone me **Telegram** kholo\n"
+                        f"2️⃣ **Settings → Devices → Link Desktop Device**\n"
+                        f"3️⃣ Is QR code ko scan karo\n"
+                        f"4️⃣ Confirm karo — login ho jayega\n\n"
+                        f"⏳ **Waiting... (3 min timeout per QR)**"
+                    )
+                )
+            except Exception as e:
+                logging.error(f"qr send error: {e}")
+
+            try:
+                await qr_login.wait(timeout=180)
+                authorized = True
+                break
+            except asyncio.TimeoutError:
+                continue
+            except QRLoginException:
+                continue
+            except SessionPasswordNeededError:
+                pw = data.get("two_fa", "None")
+                if pw and pw != "None":
+                    await t_client.sign_in(password=pw)
+                    authorized = True
+                    break
+                else:
+                    await app.send_message(
+                        user_id,
+                        "❌ **Account has 2FA but no password was provided!**\n"
+                        "Please add the account again via OTP flow and enter the 2FA password."
+                    )
+                    await t_client.disconnect()
+                    temp_data.pop(user_id, None)
+                    user_states.pop(user_id, None)
+                    return
+
+        if not authorized or not await t_client.is_user_authorized():
+            await app.send_message(
+                user_id,
+                "❌ **QR login failed or timed out!**\n\n"
+                "Please try adding the account again (OTP or QR method)."
+            )
+            try:
+                await t_client.disconnect()
+            except Exception:
+                pass
+            temp_data.pop(user_id, None)
+            user_states.pop(user_id, None)
+            return
+
+        me = await t_client.get_me()
+        phone = f"+{me.phone}"
+        session_str = t_client.session.save()
+        await t_client.disconnect()
+        t_client = None
+
+        acc_doc = {
+            "category": data.get("category", "General"),
+            "country": data.get("country", "Global"),
+            "year": data.get("year", "N/A"),
+            "price": data.get("price", 0.0),
+            "cashback": data.get("cashback", 0.0),
+            "phone_number": phone,
+            "session_string": session_str,
+            "two_fa": data.get("two_fa", "None"),
+            "status": "AVAILABLE",
+            "sold_to": None,
+            "added_by": user_id,
+            "added_by_name": "QR Login",
+            "added_at": datetime.now()
+        }
+        res = await accounts_col.insert_one(acc_doc)
+
+        # Stock attribution log — payout proof
+        await stock_logs_col.insert_one({
+            "action": "ADD",
+            "admin_id": user_id,
+            "admin_name": "QR Login",
+            "account_id": str(res.inserted_id),
+            "phone_number": phone,
+            "category": data.get("category", "General"),
+            "country": data.get("country", "Global"),
+            "year": data.get("year", "N/A"),
+            "price": data.get("price", 0.0),
+            "date_str": datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+        })
+
+        # Owner ko instant DM notification
+        try:
+            flag = get_flag(data.get("country", ""))
+            await app.send_message(
+                OWNER_ID,
+                f"📥 **NEW STOCK ADDED VIA QR LOGIN**\n\n"
+                f"👨‍💻 **Admin:** `{user_id}`\n"
+                f"📞 **Phone:** `{phone}`\n"
+                f"📂 **Category:** {data.get('category', 'General')}\n"
+                f"{flag} **Country:** {data.get('country', 'Global')} ({data.get('year', 'N/A')})\n"
+                f"💵 **Price:** {price_label(data.get('price', 0.0))}\n"
+                f"🕐 **Time:** {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}"
+            )
+        except Exception:
+            pass
+
+        temp_data.pop(user_id, None)
+        user_states.pop(user_id, None)
+        flag = get_flag(data.get("country", ""))
+        await app.send_message(
+            user_id,
+            f"✅ **Account Added to MongoDB Stock via QR Login!**\n\n"
+            f"📂 **Category:** {data.get('category', 'General')}\n"
+            f"{flag} **Location:** {data.get('country', 'Global')} ({data.get('year', 'N/A')})\n"
+            f"📞 **Phone:** `{phone}`\n"
+            f"👨‍💻 **Added By:** `{user_id}` (logged for payout tracking)",
+            reply_markup=get_admin_panel_keyboard(user_id)
+        )
+
+    except Exception as e:
+        logging.error(f"QR login error: {e}")
+        try:
+            await app.send_message(user_id, f"❌ QR login error: `{e}`")
+        except Exception:
+            pass
+        temp_data.pop(user_id, None)
+        user_states.pop(user_id, None)
+        if t_client:
+            try:
+                await t_client.disconnect()
+            except Exception:
+                pass
+
 # ==================== OTP LISTENER ENGINE WITH REFUND ====================
 async def _one_time_refund(user_id: int, acc_id: str, price: float) -> bool:
     acc = await accounts_col.find_one_and_update(
@@ -1002,6 +1287,8 @@ def get_admin_panel_keyboard(user_id: int):
         # --- Stock Add History (Owner Only) ---
         buttons.append([InlineKeyboardButton("📜 Stock Add History (Owner)", callback_data="adm_stock_history")])
         buttons.append([InlineKeyboardButton("💰 Payout System (Owner)", callback_data="adm_payout_panel")])
+        # --- Expired Stock Purge (Owner Only) ---
+        buttons.append([InlineKeyboardButton("🧹 Expired Stock Purge (Owner)", callback_data="adm_expired_purge_panel")])
 
     buttons.append([InlineKeyboardButton("🔙 Exit Admin Panel", callback_data="user_main_menu")])
     return InlineKeyboardMarkup(buttons)
@@ -1171,6 +1458,9 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data == "dep_mode_crypto":
+        if await has_pending_request(user_id):
+            await query.answer(get_pending_block_text(), show_alert=True)
+            return
         user_states[user_id] = "WAIT_CRYPTO_AMOUNT"
         await query.message.edit_text(
             f"🟡 **CRYPTO DEPOSIT (USDT — BINANCE PAY)**\n\n"
@@ -1182,6 +1472,9 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data == "dep_mode_manual":
+        if await has_pending_request(user_id):
+            await query.answer(get_pending_block_text(), show_alert=True)
+            return
         user_states[user_id] = "WAIT_DEPOSIT_AMOUNT_MANUAL"
         await query.message.edit_text(
             f"✍️ **MANUAL DEPOSIT MONEY (UPI / INR)**\n\n"
@@ -1191,6 +1484,9 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
     elif data == "dep_mode_auto":
+        if await has_pending_request(user_id):
+            await query.answer(get_pending_block_text(), show_alert=True)
+            return
         user_states[user_id] = "WAIT_DEPOSIT_AMOUNT_AUTO"
         await query.message.edit_text(
             f"⚡ **AUTOMATIC DEPOSIT MONEY (UPI / INR)**\n\n"
@@ -1227,6 +1523,10 @@ async def callback_router(client: Client, query: CallbackQuery):
             return
         if pay.get("status") == "SUCCESS":
             await query.answer("✅ This deposit has already been credited!", show_alert=True)
+            return
+
+        if await has_pending_request(user_id):
+            await query.answer(get_pending_block_text(), show_alert=True)
             return
 
         await payments_col.update_one({"_id": ObjectId(pay_id)}, {"$set": {"status": "MANUAL"}})
@@ -1866,6 +2166,111 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         await query.answer(f"✅ Removed {res.deleted_count} items from stock!", show_alert=True)
         await query.message.edit_text("✅ **Stock removed successfully!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]]))
+
+    # ---- EXPIRED STOCK PURGE PANEL (OWNER ONLY) ----
+    elif data == "adm_expired_purge_panel":
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Owner Only!", show_alert=True)
+            return
+        await query.answer("🧹 Loading expired stock...", show_alert=False)
+
+        pipeline = [
+            {"$match": {"status": "EXPIRED"}},
+            {"$group": {
+                "_id": {
+                    "category": "$category",
+                    "country": "$country",
+                    "year": "$year",
+                    "price": "$price"
+                },
+                "sample_id": {"$first": "$_id"},
+                "count": {"$sum": 1}
+            }}
+        ]
+        expired_groups = await accounts_col.aggregate(pipeline).to_list(length=100)
+
+        total_expired = await accounts_col.count_documents({"status": "EXPIRED"})
+
+        if not expired_groups:
+            text = (
+                "🧹 **EXPIRED STOCK PURGE PANEL (Owner Only)**\n\n"
+                "🎉 No expired accounts! Stock is clean."
+            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+            await query.message.edit_text(text, reply_markup=kb)
+            return
+
+        text = (
+            "🧹 **EXPIRED STOCK PURGE PANEL (Owner Only)**\n\n"
+            f"💀 **Total Expired Accounts:** {total_expired}\n\n"
+            "_Tap a group to permanently delete those EXPIRED accounts from MongoDB._"
+        )
+        buttons = []
+        for s in expired_groups:
+            info = s["_id"]
+            sample_id = str(s["sample_id"])
+            cat = info.get("category", "General")
+            country = info["country"]
+            year = info["year"]
+            price = info["price"]
+            count = s["count"]
+            flag = get_flag(country)
+
+            btn_label = f"🗑️ Purge [{cat}] {flag} {country} ({year}) | {price_label(price)} | Count: {count}"
+            buttons.append([InlineKeyboardButton(btn_label, callback_data=f"adm_purgestk_{sample_id}")])
+
+        buttons.append([InlineKeyboardButton("🗑️ Purge ALL Expired", callback_data="adm_purge_all")])
+        buttons.append([InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")])
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("adm_purgestk_"):
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Owner Only!", show_alert=True)
+            return
+        sample_id = data.split("_")[2]
+
+        sample_doc = await accounts_col.find_one({"_id": ObjectId(sample_id)})
+        if not sample_doc:
+            await query.answer("❌ Expired group not found or already purged!", show_alert=True)
+            return
+
+        res = await accounts_col.delete_many({
+            "category": sample_doc.get("category"),
+            "country": sample_doc.get("country"),
+            "year": sample_doc.get("year"),
+            "price": sample_doc.get("price"),
+            "status": "EXPIRED"
+        })
+
+        await query.answer(f"✅ Purged {res.deleted_count} expired accounts!", show_alert=True)
+        await query.message.edit_text("✅ **Expired stock purged successfully!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧹 Back to Purge Panel", callback_data="adm_expired_purge_panel")]]))
+
+    elif data == "adm_purge_all":
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Owner Only!", show_alert=True)
+            return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Yes, Purge ALL Expired Accounts", callback_data="adm_purge_all_yes")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="adm_expired_purge_panel")]
+        ])
+        await query.message.edit_text(
+            "⚠️ **PURGE ALL EXPIRED ACCOUNTS?**\n\n"
+            "This will **permanently delete ALL EXPIRED accounts** from MongoDB.\n"
+            "This action is **irreversible**! Are you sure?",
+            reply_markup=kb
+        )
+
+    elif data == "adm_purge_all_yes":
+        if user_id != OWNER_ID:
+            await query.answer("🚫 Owner Only!", show_alert=True)
+            return
+        res = await accounts_col.delete_many({"status": "EXPIRED"})
+        await query.answer(f"✅ Purged {res.deleted_count} expired accounts!", show_alert=True)
+        await query.message.edit_text(
+            f"✅ **Purged {res.deleted_count} expired accounts from stock!**",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+        )
+
     elif data == "admin_change_price":
         if user_id != OWNER_ID:
             await query.answer("🚫 Only Owner can change stock prices!", show_alert=True)
@@ -2310,6 +2715,7 @@ async def callback_router(client: Client, query: CallbackQuery):
             await query.answer("⚠️ Already processed by another admin!", show_alert=True)
             return
 
+        await resolve_pending_request(req_id, "RESOLVED_APPROVED")
         await update_balance(dep_user_id, amount)
         await record_deposit(dep_user_id, amount, currency="INR", dep_type="MANUAL", approved_by=user_id)
         admin_mention = query.from_user.mention
@@ -2351,6 +2757,7 @@ async def callback_router(client: Client, query: CallbackQuery):
             await query.answer("⚠️ Already processed by another admin!", show_alert=True)
             return
 
+        await resolve_pending_request(req_id, "RESOLVED_APPROVED")
         await update_usdt_balance(dep_user_id, amount_usdt)
         await record_deposit(dep_user_id, amount_usdt, currency="USDT", dep_type="USDT", approved_by=user_id)
         admin_mention = query.from_user.mention
@@ -2388,6 +2795,8 @@ async def callback_router(client: Client, query: CallbackQuery):
             await query.answer("⚠️ Already processed!", show_alert=True)
             return
 
+        await resolve_pending_request(req_id, "RESOLVED_REJECTED")
+
         try:
             await query.message.edit_reply_markup(reply_markup=None)
             await query.message.edit_text(query.message.text + f"\n\n❌ **REJECTED** by {query.from_user.mention}")
@@ -2409,6 +2818,8 @@ async def callback_router(client: Client, query: CallbackQuery):
         if not res:
             await query.answer("⚠️ Already processed by another admin!", show_alert=True)
             return
+
+        await resolve_pending_request(req_id, "RESOLVED_REJECTED")
 
         admin_mention = query.from_user.mention
 
@@ -2443,9 +2854,36 @@ async def callback_router(client: Client, query: CallbackQuery):
             await query.answer("⚠️ Already processed!", show_alert=True)
             return
 
+        await resolve_pending_request(req_id, "RESOLVED_WITHDRAW_PAID")
+
         owner_mention = query.from_user.mention
         await query.message.edit_caption(caption=query.message.caption + f"\n\n✅ **WITHDRAWAL SENT & APPROVED** by {owner_mention}", reply_markup=None)
         await app.send_message(wth_user_id, f"🎉 **Withdrawal Approved!** ₹{amount:.2f} has been sent to your QR account.")
+
+    # ==================== ADD ACCOUNT METHOD CHOICE (OTP / QR) ====================
+    elif data == "adm_add_method_otp":
+        if not has_perm(user_id, "add_acc"): return
+        if user_id not in temp_data or "category" not in temp_data.get(user_id, {}):
+            await query.answer("⚠️ Session expired! Start again from Add Account.", show_alert=True)
+            return
+        user_states[user_id] = "ADM_STEP_PHONE"
+        await query.message.edit_text(
+            "📞 **OTP METHOD — Enter Account Phone Number (with Country Code e.g. `+1234567890`):**",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_panel")]])
+        )
+
+    elif data == "adm_add_acc_qr":
+        if not has_perm(user_id, "add_acc"): return
+        if user_id not in temp_data or "category" not in temp_data.get(user_id, {}):
+            await query.answer("⚠️ Session expired! Start again from Add Account.", show_alert=True)
+            return
+        user_states[user_id] = "ADM_STEP_QR_WAIT"
+        await query.message.edit_text(
+            "📷 **QR METHOD — Starting QR Login...**\n\n"
+            "⏳ Generating QR code, please wait...",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]])
+        )
+        asyncio.create_task(run_qr_login(user_id))
 
 # ==================== PHOTO RECEIVER ====================
 @app.on_message(filters.photo & filters.private)
@@ -2472,9 +2910,15 @@ async def photo_receiver(client: Client, message: Message):
         amount_usdt = temp_data[user_id]["crypto_amount"]
         user_states.pop(user_id, None)
 
+        if await has_pending_request(user_id):
+            await message.reply_text(get_pending_block_text())
+            return
+
         req_doc = {"type": "CRYPTO_DEPOSIT", "status": "PENDING"}
         req_res = await requests_col.insert_one(req_doc)
         req_id = str(req_res.inserted_id)
+
+        await create_pending_request(user_id, "CRYPTO_DEPOSIT", req_id)
 
         await message.reply_text("⏳ **Crypto deposit proof submitted! Admins are verifying your payment.**")
 
@@ -2508,6 +2952,8 @@ async def photo_receiver(client: Client, message: Message):
         req_doc = {"type": "WITHDRAW", "status": "PENDING"}
         req_res = await requests_col.insert_one(req_doc)
         req_id = str(req_res.inserted_id)
+
+        await create_pending_request(user_id, "WITHDRAW", req_id)
 
         await message.reply_text("⏳ **Withdrawal request submitted! Sent to Owner for payment processing.**")
 
@@ -2638,6 +3084,11 @@ async def text_router(client: Client, message: Message):
                 await message.reply_text(f"❌ **Minimum Deposit limit is ₹{MIN_DEPOSIT:.2f}.**")
                 return
 
+            if await has_pending_request(user_id):
+                await message.reply_text(get_pending_block_text())
+                user_states.pop(user_id, None)
+                return
+
             pay_doc = {
                 "user_id": user_id,
                 "amount": amount,
@@ -2646,6 +3097,8 @@ async def text_router(client: Client, message: Message):
             }
             pay_res = await payments_col.insert_one(pay_doc)
             pay_id = str(pay_res.inserted_id)
+
+            await create_pending_request(user_id, "AUTO_DEPOSIT", pay_id)
 
             user_states.pop(user_id, None)
             qr_image = generate_upi_qr(UPI_ID_TEXT, PAYEE_NAME, amount)
@@ -2678,9 +3131,15 @@ async def text_router(client: Client, message: Message):
         amount = data["amount"]
         user_states.pop(user_id, None)
 
+        if await has_pending_request(user_id):
+            await message.reply_text(get_pending_block_text())
+            return
+
         req_doc = {"type": "DEPOSIT", "status": "PENDING"}
         req_res = await requests_col.insert_one(req_doc)
         req_id = str(req_res.inserted_id)
+
+        await create_pending_request(user_id, "DEPOSIT", req_id)
 
         await message.reply_text("⏳ **Deposit proof submitted! Admins are verifying your payment.**")
 
@@ -3066,8 +3525,19 @@ async def text_router(client: Client, message: Message):
         if not has_perm(user_id, "add_acc"): return
         try:
             temp_data[user_id]["cashback"] = float(message.text.strip())
-            user_states[user_id] = "ADM_STEP_PHONE"
-            await message.reply_text("📞 **Enter Account Phone Number (with Country Code e.g. `+1234567890`):**")
+            user_states[user_id] = "ADM_STEP_METHOD_CHOICE"
+            flag = get_flag(temp_data[user_id].get("country", ""))
+            await message.reply_text(
+                "🛠️ **Choose Add Method:**\n\n"
+                "📲 **OTP** — Login via OTP code (you enter the code here).\n"
+                "📷 **QR** — Bot generates a QR code; target phone scans it "
+                "(Settings → Devices → Link Desktop Device).",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📲 Add via OTP", callback_data="adm_add_method_otp")],
+                    [InlineKeyboardButton("📷 Add via QR", callback_data="adm_add_acc_qr")],
+                    [InlineKeyboardButton("🔙 Cancel (Back to Admin Panel)", callback_data="admin_panel")]
+                ])
+            )
         except ValueError:
             await message.reply_text("❌ Please enter numbers only:")
 
@@ -3174,7 +3644,9 @@ async def text_router(client: Client, message: Message):
 # ==================== START SERVER ====================
 if __name__ == "__main__":
     threading.Thread(target=_email_watcher_loop, daemon=True).start()
+    threading.Thread(target=_expired_thread_runner, daemon=True).start()
     loop = asyncio.get_event_loop()
+    MAIN_LOOP = loop
     loop.run_until_complete(init_db())
     print("🚀 Mongo Engine Activated!")
     app.run()
